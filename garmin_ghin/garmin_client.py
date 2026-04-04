@@ -2,10 +2,12 @@
 
 import logging
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from garminconnect import Garmin
+from garminconnect.exceptions import GarminConnectTooManyRequestsError
 
 from .config import GarminConfig
 from .scorecard import HoleScore, Scorecard
@@ -41,29 +43,54 @@ class GarminClient:
         except Exception as e:
             logger.info("Garmin: cached token login failed (%s), trying fresh login", e)
 
-        # Second try: full login with credentials
-        try:
-            client = Garmin(self._config.email, self._config.password)
-            client.login()
-            client.garth.dump(tokenstore)
-            logger.info("Garmin: fresh login succeeded, tokens cached to %s", tokenstore)
-        except Exception as e:
-            logger.error("Garmin login failed: %s", e)
-            print(
-                "\n--- Garmin Login Failed ---\n"
-                f"Error: {e}\n\n"
-                "Troubleshooting:\n"
-                "  1. Verify your GARMIN_EMAIL and GARMIN_PASSWORD in .env\n"
-                "  2. Try logging into connect.garmin.com in a browser first\n"
-                "  3. If you have MFA/2FA enabled, that may cause issues\n"
-                "     (try disabling it temporarily for first login)\n"
-                "  4. Garmin may be rate-limiting logins — wait a few minutes\n"
-                "  5. Check https://github.com/cyberjunky/python-garminconnect/issues\n"
-                "     for known auth issues\n"
-                f"  6. Try: pip install --upgrade garminconnect garth\n",
-                file=sys.stderr,
-            )
-            raise
+        # Second try: full login with credentials (with retry on rate limit)
+        backoff_delays = [30, 60, 120, 300]  # seconds: 30s, 1m, 2m, 5m
+        last_error = None
+
+        for attempt in range(len(backoff_delays) + 1):
+            try:
+                client = Garmin(self._config.email, self._config.password)
+                client.login()
+                client.garth.dump(tokenstore)
+                logger.info("Garmin: fresh login succeeded, tokens cached to %s", tokenstore)
+                break
+            except GarminConnectTooManyRequestsError as e:
+                last_error = e
+                if attempt < len(backoff_delays):
+                    wait = backoff_delays[attempt]
+                    print(
+                        f"Rate limited by Garmin (attempt {attempt + 1}). "
+                        f"Waiting {wait}s before retry...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error("Garmin login failed after %d retries: %s", attempt, e)
+                    print(
+                        "\n--- Garmin Login Failed (Rate Limited) ---\n"
+                        "Garmin is blocking login attempts. Wait 15-20 minutes\n"
+                        "and try again. Do NOT retry rapidly — it makes it worse.\n",
+                        file=sys.stderr,
+                    )
+                    raise
+            except Exception as e:
+                last_error = e
+                logger.error("Garmin login failed: %s", e)
+                print(
+                    "\n--- Garmin Login Failed ---\n"
+                    f"Error: {e}\n\n"
+                    "Troubleshooting:\n"
+                    "  1. Verify your GARMIN_EMAIL and GARMIN_PASSWORD in .env\n"
+                    "  2. Try logging into connect.garmin.com in a browser first\n"
+                    "  3. If you have MFA/2FA enabled, that may cause issues\n"
+                    "     (try disabling it temporarily for first login)\n"
+                    "  4. Garmin may be rate-limiting logins — wait a few minutes\n"
+                    "  5. Check https://github.com/cyberjunky/python-garminconnect/issues\n"
+                    "     for known auth issues\n"
+                    "  6. Try: pip install --upgrade garminconnect garth\n",
+                    file=sys.stderr,
+                )
+                raise
 
         self._client = client
         return client
