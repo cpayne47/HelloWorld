@@ -101,16 +101,24 @@ def cmd_bulk(args) -> None:
             try:
                 scorecard = client.get_scorecard(sc_id, href=href)
 
+                if not scorecard.holes:
+                    print(f"    -> PARSER ERROR: No holes extracted. Stopping.")
+                    print(f"    -> Debug files saved. Check debug_scorecard_text.txt")
+                    errors += 1
+                    break
+
                 if scorecard.played_holes:
                     db_id = save_scorecard(scorecard)
+                    nine = scorecard.nine_played
+                    nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
                     vs_par = scorecard.computed_total - scorecard.computed_par
                     print(f"    -> {scorecard.course_name} | {scorecard.date_played} | "
-                          f"Score: {scorecard.computed_total} ({vs_par:+d}) | "
+                          f"{nine_label} | Score: {scorecard.computed_total} ({vs_par:+d}) | "
                           f"Putts: {scorecard.total_putts or '-'} | "
                           f"Saved (id={db_id})")
                     saved += 1
                 else:
-                    print(f"    -> No hole data found, skipping")
+                    print(f"    -> 18 holes parsed but all dashes — no scores recorded, skipping")
                     errors += 1
 
                 # Brief pause between fetches to be polite

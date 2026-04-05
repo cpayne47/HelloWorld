@@ -285,35 +285,39 @@ class GarminClient:
     def _parse_scorecard_page(self, driver, scorecard_id: str, page_text: str) -> Scorecard:
         """Extract scorecard data from the rendered HTML page.
 
-        Garmin uses a row-per-stat layout (not row-per-hole):
-            Hole   1  2  3 ... 9  Out  10 ... 18  In  Total
-            Par    3  3  4 ...
-            Score  4  4  5 ...
-            Putts  2  1  3 ...
+        Garmin always lays out 18 holes on every scorecard:
+            Hole   1  2 ... 9  Out  10 11 ... 18  In  Total
+            Par    3  3 ... 3   27   3  3 ...  3  27    54
+            Score  4  — ... —   33   —  5 ...  3  33    33
+            GIR    ✓  ✗ ...    6/9   ...           0/0  6/9
+            Putts  2  — ... —   21   —  1 ...  2  19    19
+
+        Each cell renders as its own line in page text. We always extract
+        all 18 holes — unplayed holes have dashes (score=None). After
+        extraction we determine front/back/both from which holes have scores.
         """
         import re
 
         lines = page_text.split("\n")
+        non_empty = [l.strip() for l in lines if l.strip()]
+
+        # Always dump page text for debugging
+        debug_text_file = Path("debug_scorecard_text.txt")
+        debug_text_file.write_text(page_text)
+        logger.debug("Page text saved to %s", debug_text_file)
 
         # Extract course name from the first few non-empty lines
-        # Typically: "Scorecards", "Desert Mountain", "No 7", "Apr 4, 2026"
         course_name = "Unknown Course"
-        non_empty = [l.strip() for l in lines if l.strip()]
         for i, line in enumerate(non_empty):
-            # Skip navigation/header text
             if line.lower() in ("scorecards", "stroke play", "men's tees",
                                 "women's tees", "hole", "par", "score", "putts",
                                 "gir", "stats", "badges"):
                 continue
-            # Skip date lines
             if re.match(r'\w+ \d{1,2}, \d{4}', line):
                 continue
-            # Skip single numbers
             if re.match(r'^\d+$', line):
                 continue
-            # First meaningful line is likely the course name
             course_name = line
-            # Check if next line is a course/tee variant (e.g., "No 7")
             if i + 1 < len(non_empty):
                 next_line = non_empty[i + 1]
                 if not re.match(r'\w+ \d{1,2}, \d{4}', next_line) and \
@@ -344,8 +348,6 @@ class GarminClient:
         # Extract tee name
         tee_name = None
         for line in non_empty:
-            if "tees" in line.lower() and line.lower() not in ("men's tees", "women's tees"):
-                continue
             if line.lower() in ("men's tees", "women's tees"):
                 tee_name = line
                 break
@@ -358,208 +360,159 @@ class GarminClient:
             tee_name=tee_name,
         )
 
-        # Parse the row-per-stat layout from page text.
-        #
-        # Garmin renders the scorecard as a table with rows:
-        #   Hole:  1  2  3 ... 9  Out  10 11 ... 18  In  Total
-        #   Par:   3  3  3 ... 3   27   3  3 ...  3  27    54
-        #   Score: 4  —  — ... —    4   —  5 ...  3  33    33
-        #   GIR:   ✓  ...        6/9   ...            0/0  6/9
-        #   Putts: 2  —  — ... —    2   —  1 ...  2  19    19
-        #
-        # In the text output, each cell is on its own line.
-        # The front 9 block has labels (Hole, Par, Score, GIR, Putts).
-        # The back 9 block often does NOT repeat the labels.
-        #
-        # Strategy: First, find each labeled section and collect its values
-        # (front 9 only). Then find where the back 9 starts (line with "10"
-        # after all labeled sections end) and collect its values in the known
-        # stat order: holes, par, score, GIR, putts.
+        # === Tokenize the scorecard table area ===
+        # Find the section between "Hole" and "Stats"/"Badges"/"Eagle or better"
+        # and collect every data token in order.
+        tokens = []  # list of: int, None (dash), True/False (GIR), or "LABEL:xxx"
+        in_table = False
+        stop_words = {"stats", "badges", "eagle or better",
+                      "exclude this scorecard", "par starter", "break 40",
+                      "welcome to the club", "break 50", "break 60 on 9",
+                      "penalty-free"}
 
-        def _parse_gir_value(s):
-            if s == "—":
-                return None
-            if s in ("\u2713", "\u2714", "\u2705", "Y", "y") or "✓" in s or "✔" in s:
-                return True
-            if s in ("X", "x", "\u2717", "\u2718", "✗", "✘") or "✕" in s or "✖" in s:
-                return False
-            return "UNKNOWN"
-
-        label_names = ["hole", "par", "score", "gir", "putts"]
-        summary_words = {"out", "in", "total"}
-
-        # === PASS 1: Collect labeled front 9 data ===
-        front = {k: [] for k in label_names}
-        current_label = None
-        last_label_end_idx = 0
-
-        for line_idx, line in enumerate(lines):
+        for line in lines:
             stripped = line.strip()
             low = stripped.lower()
 
-            if low in label_names:
-                current_label = low
-                continue
-
-            if current_label is None:
-                continue
-
-            if low in summary_words:
-                continue
-            if re.match(r'^\d+/\d+$', stripped):
-                continue
             if not stripped:
                 continue
 
-            if current_label == "gir":
-                gv = _parse_gir_value(stripped)
-                if gv != "UNKNOWN":
-                    front["gir"].append(gv)
-                else:
-                    # Non-GIR value — end GIR section
-                    if front["gir"]:
-                        last_label_end_idx = line_idx
-                        current_label = None
+            if low == "hole" and not in_table:
+                in_table = True
+                tokens.append("LABEL:hole")
                 continue
 
-            if stripped == "—":
-                front[current_label].append(None)
+            if not in_table:
                 continue
 
-            if stripped.isdigit():
-                val = int(stripped)
-                if current_label == "hole":
-                    if 1 <= val <= 9:
-                        front["hole"].append(val)
-                else:
-                    front[current_label].append(val)
-                continue
-
-            # Non-data line
-            if front[current_label]:
-                last_label_end_idx = line_idx
-                current_label = None
-
-        # Trim front 9 stat rows to 9 values (remove Out summary total)
-        for label in ["par", "score", "putts"]:
-            if len(front[label]) > 9:
-                front[label] = front[label][:9]
-
-        logger.debug("Front 9 - holes: %s, par: %s, score: %s, gir: %s, putts: %s",
-                      front["hole"], front["par"], front["score"],
-                      front["gir"], front["putts"])
-
-        # === PASS 2: Find and parse back 9 ===
-        back = {k: [] for k in label_names}
-
-        # Find line with "10" that starts the back 9 block
-        back9_start = None
-        for i in range(last_label_end_idx, len(lines)):
-            if lines[i].strip() == "10":
-                back9_start = i
+            # Stop at stats/badges section
+            if low in stop_words:
                 break
 
-        if back9_start is not None:
-            # Collect all tokenized values from back9_start to Stats/Badges
-            raw_values = []  # list of (value, type): "num", "dash", or "skip"
-            for i in range(back9_start, len(lines)):
-                stripped = lines[i].strip()
-                low = stripped.lower()
-
-                if low in ("eagle or better", "stats", "badges",
-                           "exclude this scorecard"):
-                    break
-                if low in summary_words:
-                    raw_values.append(("SUMMARY", "skip"))
-                    continue
-                if re.match(r'^\d+/\d+$', stripped):
-                    raw_values.append(("FRAC", "skip"))
-                    continue
-                if not stripped:
-                    continue
-                if stripped == "—":
-                    raw_values.append((None, "dash"))
-                elif stripped.isdigit():
-                    raw_values.append((int(stripped), "num"))
-
-            # Extract hole numbers (10-18)
-            idx = 0
-            while idx < len(raw_values):
-                val, vtype = raw_values[idx]
-                if vtype == "num" and isinstance(val, int) and 10 <= val <= 18:
-                    back["hole"].append(val)
-                    idx += 1
-                elif vtype == "skip":
-                    idx += 1
-                else:
-                    break
-
-            num_back = len(back["hole"])
-            if num_back == 0:
-                logger.debug("No back 9 holes found")
-            else:
-                while idx < len(raw_values) and raw_values[idx][1] == "skip":
-                    idx += 1
-
-                def _collect_stat(start_idx, n):
-                    """Collect n data values, then skip 2 summary values."""
-                    vals = []
-                    i = start_idx
-                    while i < len(raw_values) and len(vals) < n:
-                        val, vtype = raw_values[i]
-                        if vtype == "skip":
-                            i += 1
-                            continue
-                        vals.append(val)
-                        i += 1
-                    # Skip 2 summary values (In total + Grand total)
-                    skipped = 0
-                    while i < len(raw_values) and skipped < 2:
-                        _, vtype = raw_values[i]
-                        if vtype in ("num", "dash", "skip"):
-                            i += 1
-                            skipped += 1
-                        else:
-                            break
-                    return vals, i
-
-                # Stats in order: par, score, [GIR fractions skipped], putts
-                back["par"], idx = _collect_stat(idx, num_back)
-                back["score"], idx = _collect_stat(idx, num_back)
-                # Skip any GIR fraction summaries between score and putts
-                while idx < len(raw_values) and raw_values[idx][1] == "skip":
-                    idx += 1
-                back["putts"], idx = _collect_stat(idx, num_back)
-
-            logger.debug("Back 9 - holes: %s, par: %s, score: %s, gir: %s, putts: %s",
-                          back["hole"], back["par"], back["score"],
-                          back["gir"], back["putts"])
-
-        # === Combine front + back ===
-        hole_nums = front["hole"] + back["hole"]
-        par_vals = front["par"] + back["par"]
-        score_vals = front["score"] + back["score"]
-        gir_vals = front["gir"] + back["gir"]
-        putts_vals = front["putts"] + back["putts"]
-
-        logger.debug("Combined(%d holes) - par: %s, score: %s, gir: %s, putts: %s",
-                      len(hole_nums), par_vals, score_vals, gir_vals, putts_vals)
-
-        # Build hole scores for played holes
-        num_holes = min(len(hole_nums), len(par_vals), len(score_vals)) if hole_nums else 0
-        for i in range(num_holes):
-            hole_num = hole_nums[i]
-            if not isinstance(hole_num, int) or hole_num < 1 or hole_num > 18:
+            # Labels
+            if low in ("par", "score", "gir", "putts"):
+                tokens.append(f"LABEL:{low}")
                 continue
-            par = par_vals[i] if par_vals[i] is not None else 4
-            score = score_vals[i] if score_vals[i] is not None else None
-            if score is None:
-                continue  # Skip unplayed holes
-            putts = putts_vals[i] if i < len(putts_vals) and putts_vals[i] is not None else None
-            gir = gir_vals[i] if i < len(gir_vals) else None
+
+            # Summary words — mark but keep (we'll use them for alignment)
+            if low in ("out", "in", "total"):
+                tokens.append(f"SUMMARY:{low}")
+                continue
+
+            # Fraction like "6/9" — skip
+            if re.match(r'^\d+/\d+$', stripped):
+                continue
+
+            # Dash
+            if stripped == "—":
+                tokens.append(None)
+                continue
+
+            # GIR checkmark/X
+            if stripped in ("\u2713", "\u2714", "\u2705") or "✓" in stripped or "✔" in stripped:
+                tokens.append(True)
+                continue
+            if stripped in ("X", "x", "\u2717", "\u2718", "✗", "✘") or "✕" in stripped or "✖" in stripped:
+                tokens.append(False)
+                continue
+
+            # Number
+            if stripped.isdigit():
+                tokens.append(int(stripped))
+                continue
+
+            # Unknown — skip
+            logger.debug("Skipping unknown token: %r", stripped)
+
+        logger.debug("Tokens (%d): %s", len(tokens), tokens[:80])
+
+        # === Parse tokens into rows ===
+        # Split tokens at LABEL markers. Each label starts a new row.
+        # A row contains the per-hole values plus summary totals.
+        rows = {}  # label -> list of values
+        current_row_label = None
+        current_row_vals = []
+
+        for token in tokens:
+            if isinstance(token, str) and token.startswith("LABEL:"):
+                # Save previous row
+                if current_row_label is not None:
+                    rows[current_row_label] = current_row_vals
+                current_row_label = token.split(":")[1]
+                current_row_vals = []
+            elif isinstance(token, str) and token.startswith("SUMMARY:"):
+                # Keep summaries as markers for alignment
+                current_row_vals.append(token)
+            else:
+                current_row_vals.append(token)
+
+        # Save last row
+        if current_row_label is not None:
+            rows[current_row_label] = current_row_vals
+
+        logger.debug("Raw rows:")
+        for label, vals in rows.items():
+            logger.debug("  %s (%d): %s", label, len(vals), vals[:25])
+
+        # === Extract 18 per-hole values from each row ===
+        # Each row has: 9 values, SUMMARY:out, [out_total], 9 values, SUMMARY:in, [in_total], SUMMARY:total, [grand_total]
+        # We need to extract just the 18 per-hole values.
+
+        def extract_18(vals):
+            """Extract exactly 18 per-hole values from a row with summaries.
+
+            Stat rows have: val*9, SUMMARY:out, total, val*9, SUMMARY:in, total, SUMMARY:total, total
+            We collect 9 data values, skip SUMMARY + its total, collect 9 more, skip rest.
+            """
+            result = []
+            i = 0
+            while i < len(vals) and len(result) < 18:
+                v = vals[i]
+                if isinstance(v, str) and v.startswith("SUMMARY:"):
+                    # Skip the summary label
+                    i += 1
+                    # Skip the total value that follows (if it's not another SUMMARY)
+                    if i < len(vals) and not (isinstance(vals[i], str) and vals[i].startswith("SUMMARY:")):
+                        i += 1
+                    continue
+                result.append(v)
+                i += 1
+            return result
+
+        # Holes are always 1-18
+        hole_nums = list(range(1, 19))
+        par_vals = extract_18(rows.get("par", []))
+        score_vals = extract_18(rows.get("score", []))
+        gir_vals = extract_18(rows.get("gir", []))
+        putts_vals = extract_18(rows.get("putts", []))
+
+        logger.debug("Extracted - holes(%d): %s", len(hole_nums), hole_nums)
+        logger.debug("Extracted - par(%d): %s", len(par_vals), par_vals)
+        logger.debug("Extracted - score(%d): %s", len(score_vals), score_vals)
+        logger.debug("Extracted - gir(%d): %s", len(gir_vals), gir_vals)
+        logger.debug("Extracted - putts(%d): %s", len(putts_vals), putts_vals)
+
+        # Validate: we should have 18 par values and 18 score values
+        if len(par_vals) != 18 or len(score_vals) != 18:
+            debug_file = Path("debug_scorecard_detail.html")
+            debug_file.write_text(driver.page_source)
+            logger.warning("Expected 18 pars and scores, got par=%d score=%d",
+                           len(par_vals), len(score_vals))
+            print(f"\nPARSER ERROR: Expected 18 values per row, got par={len(par_vals)} score={len(score_vals)}.")
+            print(f"Debug files: {debug_text_file}, {debug_file}")
+            print(f"Tokens ({len(tokens)}): {tokens[:60]}")
+            return scorecard  # Return empty scorecard — caller should stop
+
+        # Build all 18 holes (unplayed holes get score=None)
+        for i in range(18):
+            hole_num = hole_nums[i] if i < len(hole_nums) else i + 1
+            par = par_vals[i] if i < len(par_vals) and isinstance(par_vals[i], int) else 3
+            score = score_vals[i] if i < len(score_vals) and isinstance(score_vals[i], int) else None
+            putts = putts_vals[i] if i < len(putts_vals) and isinstance(putts_vals[i], int) else None
+            gir = gir_vals[i] if i < len(gir_vals) and isinstance(gir_vals[i], bool) else None
 
             scorecard.holes.append(HoleScore(
-                hole_number=hole_num,
+                hole_number=hole_num if isinstance(hole_num, int) else i + 1,
                 par=par,
                 score=score,
                 putts=putts,
@@ -625,13 +578,6 @@ class GarminClient:
                     except (ValueError, IndexError):
                         pass
 
-        if not scorecard.holes:
-            # Save for debugging
-            debug_file = Path("debug_scorecard_detail.html")
-            debug_file.write_text(driver.page_source)
-            logger.warning("Could not extract hole data. HTML saved to %s", debug_file)
-            print(f"\nPage text:\n{page_text[:2000]}")
-
         # Apply correct pars from course database (Garmin's pars can be wrong)
         garmin_tee = scorecard.garmin_tee_name or ""
         correct_pars = get_correct_pars(scorecard.course_name)
@@ -641,32 +587,20 @@ class GarminClient:
             for hole in scorecard.holes:
                 idx = hole.hole_number - 1
                 if idx < len(correct_pars):
-                    old_par = hole.par
                     hole.par = correct_pars[idx % len(correct_pars)]
-                    if old_par != hole.par:
-                        logger.debug("Hole %d: par %d -> %d", hole.hole_number, old_par, hole.par)
 
-            # Map Garmin tee name to actual tee box (e.g. Men's Tees -> T3)
             tee_box = get_tee_box(scorecard.course_name, garmin_tee)
             if tee_box:
                 scorecard.tee_name = tee_box
-                logger.info("Mapped '%s' -> %s", garmin_tee, tee_box)
 
-            # Expand to 18 holes with correct pars for unplayed holes
-            scorecard.ensure_18_holes(correct_pars)
-
-            # Update to GHIN course name if available
             ghin_name = get_ghin_name(scorecard.course_name)
             if ghin_name:
                 scorecard.course_name = ghin_name
         else:
             logger.info("No course database entry for '%s' — using Garmin pars",
                         scorecard.course_name)
-            scorecard.ensure_18_holes()
 
-        # Compute scoring stats from hole data
         scorecard.compute_stats()
-
         return scorecard
 
     def close(self) -> None:
