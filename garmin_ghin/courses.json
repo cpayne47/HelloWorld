@@ -19,6 +19,15 @@
         }
       },
       "default_tee": "Men's Tees"
+    },
+    {
+      "garmin_name": "Pebble Beach Golf Links - Peter Hay Par Three",
+      "ghin_name": "The Hay",
+      "num_holes": 9,
+      "par": 3,
+      "pars": [3, 3, 3, 3, 3, 3, 3, 3, 3],
+      "tees": {},
+      "default_tee": null
     }
   ]
 }

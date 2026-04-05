@@ -165,6 +165,28 @@ def cmd_history(args) -> None:
     print(f"\n{len(scorecards)} round(s). Use 'history --id N' for full scorecard.")
 
 
+def cmd_fix_names() -> None:
+    """Apply course name mappings from courses.json to existing DB records."""
+    from .course_db import _load_db
+    from .scorecard_db import rename_course
+
+    db = _load_db()
+    total = 0
+    for course in db.get("courses", []):
+        garmin_name = course.get("garmin_name", "")
+        ghin_name = course.get("ghin_name", "")
+        if garmin_name and ghin_name and garmin_name != ghin_name:
+            count = rename_course(garmin_name, ghin_name)
+            if count:
+                print(f"  Renamed '{garmin_name}' -> '{ghin_name}' ({count} records)")
+                total += count
+
+    if total:
+        print(f"\nUpdated {total} record(s).")
+    else:
+        print("All course names already up to date.")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Garmin golf scorecard tools")
     parser.add_argument(
@@ -198,6 +220,10 @@ def main() -> None:
         help="Max scorecards to show (default: 50)",
     )
 
+    # fix-names subcommand
+    subparsers.add_parser("fix-names",
+                          help="Apply course name mappings from courses.json to existing DB records")
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -211,6 +237,8 @@ def main() -> None:
         cmd_bulk(args)
     elif args.command == "history":
         cmd_history(args)
+    elif args.command == "fix-names":
+        cmd_fix_names()
     else:
         parser.print_help()
 

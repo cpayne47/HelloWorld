@@ -24,6 +24,20 @@ def _get_conn() -> sqlite3.Connection:
     return conn
 
 
+def rename_course(old_name: str, new_name: str) -> int:
+    """Rename a course in all existing scorecards. Returns number of rows updated."""
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            "UPDATE scorecards SET course_name = ? WHERE course_name = ?",
+            (new_name, old_name)
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS scorecards (
