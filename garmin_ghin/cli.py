@@ -114,7 +114,6 @@ def cmd_bulk(args) -> None:
                     vs_par = scorecard.computed_total - scorecard.computed_par
                     print(f"    -> {scorecard.course_name} | {scorecard.date_played} | "
                           f"{nine_label} | Score: {scorecard.computed_total} ({vs_par:+d}) | "
-                          f"Putts: {scorecard.total_putts or '-'} | "
                           f"Saved (id={db_id})")
                     saved += 1
                 else:

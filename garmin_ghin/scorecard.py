@@ -169,8 +169,6 @@ class Scorecard:
         ]
         if self.tee_name:
             lines.append(f"Tees:   {self.tee_name}")
-        if self.total_putts is not None:
-            lines.append(f"Putts:  {self.total_putts}")
 
         # Scoring distribution
         lines.append("")
@@ -184,12 +182,7 @@ class Scorecard:
             dist_parts.append(f"Dbl+: {self.double_bogeys_or_worse}")
         lines.append("  ".join(dist_parts))
 
-        if self.fairways_hit:
-            lines.append(f"Fairways: {self.fairways_hit}  GIR: {self.gir_summary or '-'}")
-        elif self.gir_summary:
-            lines.append(f"GIR: {self.gir_summary}")
-
-        # Full 18-hole scorecard
+        # Full 18-hole scorecard (par + score only)
         lines.append("")
         lines.append("       " + "".join(f"{n:>4}" for n in range(1, 10)) + "   Out")
         lines.append("  Par  " + "".join(f"{self.holes[n-1].par:>4}" for n in range(1, 10))
@@ -206,35 +199,6 @@ class Scorecard:
                 front_scores.append("   -")
         lines.append("Score  " + "".join(front_scores)
                       + (f"  {front_total:>4}" if any(self.holes[n-1].played for n in range(1, 10)) else "     -"))
-
-        front_gir = []
-        for n in range(1, 10):
-            h = self.holes[n - 1]
-            if not h.played:
-                front_gir.append("   -")
-            elif h.gir is True:
-                front_gir.append("   Y")
-            elif h.gir is False:
-                front_gir.append("   X")
-            else:
-                front_gir.append("    ")
-        lines.append("  GIR  " + "".join(front_gir))
-
-        front_putts = []
-        front_putts_total = 0
-        has_front_putts = False
-        for n in range(1, 10):
-            h = self.holes[n - 1]
-            if h.played and h.putts is not None:
-                front_putts.append(f"{h.putts:>4}")
-                front_putts_total += h.putts
-                has_front_putts = True
-            elif h.played:
-                front_putts.append("    ")
-            else:
-                front_putts.append("   -")
-        lines.append("Putts  " + "".join(front_putts)
-                      + (f"  {front_putts_total:>4}" if has_front_putts else "     -"))
 
         # Back 9
         lines.append("")
@@ -256,37 +220,6 @@ class Scorecard:
         lines.append("Score  " + "".join(back_scores)
                       + (f"  {back_total:>4}" if any(self.holes[n-1].played for n in range(10, 19)) else "     -")
                       + f"  {total_score:>4}")
-
-        back_gir = []
-        for n in range(10, 19):
-            h = self.holes[n - 1]
-            if not h.played:
-                back_gir.append("   -")
-            elif h.gir is True:
-                back_gir.append("   Y")
-            elif h.gir is False:
-                back_gir.append("   X")
-            else:
-                back_gir.append("    ")
-        lines.append("  GIR  " + "".join(back_gir))
-
-        back_putts = []
-        back_putts_total = 0
-        has_back_putts = False
-        for n in range(10, 19):
-            h = self.holes[n - 1]
-            if h.played and h.putts is not None:
-                back_putts.append(f"{h.putts:>4}")
-                back_putts_total += h.putts
-                has_back_putts = True
-            elif h.played:
-                back_putts.append("    ")
-            else:
-                back_putts.append("   -")
-        total_putts_display = front_putts_total + back_putts_total
-        lines.append("Putts  " + "".join(back_putts)
-                      + (f"  {back_putts_total:>4}" if has_back_putts else "     -")
-                      + (f"  {total_putts_display:>4}" if has_front_putts or has_back_putts else "     -"))
 
         issues = self.validate()
         if issues:
