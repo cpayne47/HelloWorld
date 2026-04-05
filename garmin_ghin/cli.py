@@ -5,78 +5,6 @@ import logging
 import sys
 
 
-def cmd_login(args) -> None:
-    """Import Garmin session cookies."""
-    from .auth import import_from_chrome, save_cookie_string
-
-    if args.chrome:
-        import_from_chrome()
-    elif args.file:
-        from pathlib import Path
-        cookie_string = Path(args.file).read_text().strip()
-        if not cookie_string:
-            print("File is empty.")
-            sys.exit(1)
-        # Strip "Cookie: " prefix if present
-        if cookie_string.lower().startswith("cookie:"):
-            cookie_string = cookie_string.split(":", 1)[1].strip()
-        save_cookie_string(cookie_string)
-    elif args.paste:
-        print("Paste your Cookie header value from browser dev tools,")
-        print("then press Enter:\n")
-        cookie_string = input("> ").strip()
-        if not cookie_string:
-            print("No cookies provided.")
-            sys.exit(1)
-        save_cookie_string(cookie_string)
-    else:
-        print("Specify a method:\n")
-        print("  python -m garmin_ghin.cli login --file cookie.txt  (read from file)")
-        print("  python -m garmin_ghin.cli login --chrome            (auto-read from Chrome)")
-        print("  python -m garmin_ghin.cli login --paste             (paste interactively)")
-
-
-def cmd_debug(args) -> None:
-    """Probe Garmin API endpoints to diagnose auth/data issues."""
-    import json
-    from .auth import load_cookies
-    import requests
-
-    cookies = load_cookies()
-    session = requests.Session()
-    for name, value in cookies.items():
-        session.cookies.set(name, value, domain=".garmin.com")
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                      "Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "application/json",
-        "NK": "NT",
-        "Di-Backend": "connectapi.garmin.com",
-    })
-
-    base = "https://connect.garmin.com"
-    endpoints = [
-        "/proxy/userprofile-service/usersocial/profile",
-        "/proxy/userprofile-service/socialProfile",
-        "/modern/proxy/userprofile-service/usersocial/profile",
-        "/proxy/activitylist-service/activities/search/activities?limit=5",
-        "/modern/proxy/activitylist-service/activities/search/activities?limit=5",
-        "/proxy/activity-service/activity/search?limit=5",
-        "/proxy/gcs-golfcommunity/api/v2/scorecard/list?limit=5",
-        "/proxy/gcs-golfcommunity/api/v2/scorecard?limit=5",
-    ]
-
-    for ep in endpoints:
-        url = base + ep
-        resp = session.get(url)
-        body = resp.text[:500] if resp.text else "(empty)"
-        print(f"\n{'='*60}")
-        print(f"GET {ep}")
-        print(f"Status: {resp.status_code}  |  Size: {len(resp.text)} bytes")
-        print(f"Body: {body}")
-
-
 def cmd_scorecard(args) -> None:
     """Fetch and display the most recent golf scorecard."""
     from .config import load_config
@@ -85,25 +13,41 @@ def cmd_scorecard(args) -> None:
     config = load_config()
     client = GarminClient(config.garmin)
 
-    print("Connecting to Garmin Connect...")
-    activities = client.get_recent_golf_rounds(days_back=args.days)
+    try:
+        print("Launching Chrome and connecting to Garmin Connect...")
+        activities = client.get_recent_golf_rounds(days_back=args.days)
 
-    if not activities:
-        print(f"No golf rounds found in the last {args.days} days.")
-        sys.exit(0)
+        if not activities:
+            print(f"No golf rounds found in the last {args.days} days.")
+            sys.exit(0)
 
-    print(f"Found {len(activities)} golf round(s).\n")
+        print(f"Found {len(activities)} golf round(s).\n")
 
-    latest = activities[0]
-    activity_id = latest.get("activityId")
-    print(f"Fetching scorecard for activity {activity_id}...\n")
+        # Show what we found
+        for i, act in enumerate(activities[:5]):
+            act_id = act.get("activityId")
+            text = act.get("text", act.get("activityName", ""))
+            href = act.get("href", "")
+            print(f"  [{i+1}] ID: {act_id}  {text}  {href}")
 
-    scorecard = client.get_scorecard(activity_id)
-    print(scorecard.summary())
+        # Fetch the most recent
+        latest = activities[0]
+        activity_id = latest.get("activityId")
 
-    issues = scorecard.validate()
-    if not issues:
-        print("\nScorecard looks good!")
+        if activity_id:
+            print(f"\nFetching scorecard for activity {activity_id}...\n")
+            scorecard = client.get_scorecard(activity_id)
+            print(scorecard.summary())
+
+            issues = scorecard.validate()
+            if not issues:
+                print("\nScorecard looks good!")
+        else:
+            print("\nCould not determine activity ID from first result.")
+            print(f"Raw data: {latest}")
+
+    finally:
+        client.close()
 
 
 def main() -> None:
@@ -113,15 +57,6 @@ def main() -> None:
         help="Enable debug logging",
     )
     subparsers = parser.add_subparsers(dest="command")
-
-    # login subcommand
-    login_parser = subparsers.add_parser("login", help="Import Garmin session cookies")
-    login_parser.add_argument("--file", type=str, help="Read cookies from a text file")
-    login_parser.add_argument("--paste", action="store_true", help="Paste cookie string interactively")
-    login_parser.add_argument("--chrome", action="store_true", help="Auto-read from Chrome browser")
-
-    # debug subcommand
-    subparsers.add_parser("debug", help="Probe Garmin API endpoints for diagnostics")
 
     # scorecard subcommand
     sc_parser = subparsers.add_parser("scorecard", help="Fetch and display most recent scorecard")
@@ -137,11 +72,7 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    if args.command == "login":
-        cmd_login(args)
-    elif args.command == "debug":
-        cmd_debug(args)
-    elif args.command == "scorecard":
+    if args.command == "scorecard":
         cmd_scorecard(args)
     else:
         parser.print_help()
