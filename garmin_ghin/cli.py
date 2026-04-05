@@ -90,8 +90,8 @@ def cmd_bulk(args) -> None:
             href = act.get("href", "")
             text = act.get("text", "")
 
-            # Check if already in database
-            if sc_id and scorecard_exists(sc_id):
+            # Check if already in database (skip unless --force)
+            if sc_id and scorecard_exists(sc_id) and not args.force:
                 print(f"  [{i+1}/{len(activities)}] {text[:50]} — already saved, skipping")
                 skipped += 1
                 continue
@@ -207,6 +207,10 @@ def main() -> None:
     bulk_parser.add_argument(
         "-n", "--days", type=int, default=3650,
         help="Look back this many days (default: 3650 = ~10 years)",
+    )
+    bulk_parser.add_argument(
+        "--force", action="store_true",
+        help="Re-extract and overwrite all scorecards, even ones already saved",
     )
 
     # history subcommand

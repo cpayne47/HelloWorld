@@ -359,97 +359,224 @@ class GarminClient:
         )
 
         # Parse the row-per-stat layout from page text.
-        # Garmin renders each cell on its own line:
-        #   Hole / 1 / 2 / ... / 9 / Out / Par / 3 / 3 / ... / 27 / Score / 4 / ...
-        # We need to find each label and collect values up to the next label or summary.
         #
-        # The page has two blocks (front 9 and back 9) with the same label sequence.
-        # We parse all values per label across both blocks.
+        # Garmin renders the scorecard as two blocks:
+        #
+        # FRONT 9 (with labels):
+        #   Hole / 1 / 2 / ... / 9 / Out
+        #   Par / 3 / 3 / ... / 27
+        #   Score / 4 / 4 / ... / 33
+        #   GIR / checkmarks.../ 6/9
+        #   Putts / 3 / 2 / ... / 21
+        #
+        # BACK 9 (NO labels — just bare values):
+        #   10 / 11 / ... / 18 / In / Total
+        #   3 / 3 / ... / 27 / 54
+        #   — / — / ... / — / 33
+        #   (GIR values)... / 0/0 / 6/9
+        #   — / — / ... / 0 / 21
+        #
+        # Strategy: parse the labeled front 9 first, then detect the back 9
+        # block starting with "10" and parse it using the known stat order.
 
-        labels = {"hole", "par", "score", "gir", "putts"}
-        summary_labels = {"out", "in", "total"}
+        def _parse_value(stripped, label):
+            """Parse a single cell value for a given label type."""
+            if stripped == "—":
+                return None
+            if label == "gir":
+                if stripped in ("\u2713", "\u2714", "\u2705", "Y", "y") or "✓" in stripped or "✔" in stripped:
+                    return True
+                elif stripped in ("X", "x", "\u2717", "\u2718", "✗", "✘") or "✕" in stripped or "✖" in stripped:
+                    return False
+                else:
+                    logger.debug("Unknown GIR value: %r", stripped)
+                    return None
+            elif stripped.isdigit():
+                return int(stripped)
+            return "SKIP"  # sentinel: not a valid data value
 
-        # Collect all values grouped by label, in order of appearance.
-        # GIR uses checkmarks/X rather than numbers.
-        all_rows = {}  # label -> list of values
+        front_labels = ["hole", "par", "score", "gir", "putts"]
+        summary_words = {"out", "in", "total"}
+
+        # === PASS 1: Parse labeled front 9 ===
+        front = {k: [] for k in front_labels}
         current_label = None
+        back9_start_idx = None  # line index where back 9 starts
 
-        for line in lines:
+        for line_idx, line in enumerate(lines):
             stripped = line.strip()
             low = stripped.lower()
 
-            if low in labels:
+            # Detect label lines
+            if low in front_labels:
                 current_label = low
-                if current_label not in all_rows:
-                    all_rows[current_label] = []
                 continue
 
             if current_label is None:
                 continue
 
-            # Skip summary labels
-            if low in summary_labels:
+            # Skip summary words
+            if low in summary_words:
                 continue
 
-            # Skip fraction stats like "6/9" (GIR/fairway summaries)
+            # Skip fraction summaries like "6/9"
             if re.match(r'^\d+/\d+$', stripped):
                 continue
 
-            if current_label == "gir":
-                # GIR values: checkmark chars, "X", or dash
-                if stripped in ("\u2713", "\u2714", "\u2705", "Y", "y") or "✓" in stripped or "✔" in stripped:
-                    all_rows["gir"].append(True)
-                elif stripped in ("X", "x", "\u2717", "\u2718", "✗", "✘") or "✕" in stripped or "✖" in stripped:
-                    all_rows["gir"].append(False)
-                elif stripped == "—":
-                    all_rows["gir"].append(None)
-                elif not stripped:
-                    continue
-                else:
-                    # Could be a unicode checkmark we didn't catch
-                    logger.debug("Unknown GIR value: %r (ord: %s)", stripped,
-                                 [ord(c) for c in stripped])
-                    all_rows["gir"].append(None)
-            elif stripped == "—":
-                all_rows[current_label].append(None)
-            elif stripped.isdigit():
-                val = int(stripped)
-                if current_label == "hole":
-                    if 1 <= val <= 18:
-                        all_rows[current_label].append(val)
-                else:
-                    all_rows[current_label].append(val)
-            else:
-                if all_rows.get(current_label):
+            val = _parse_value(stripped, current_label)
+            if val == "SKIP":
+                # Non-data line — end current label
+                if front[current_label]:
+                    # Check if this is the start of the back 9 (bare "10")
+                    if stripped == "10" or (stripped.isdigit() and int(stripped) == 10):
+                        back9_start_idx = line_idx
                     current_label = None
+                continue
 
-        hole_nums = all_rows.get("hole", [])
-        par_vals = all_rows.get("par", [])
-        score_vals = all_rows.get("score", [])
-        putts_vals = all_rows.get("putts", [])
-        gir_vals = all_rows.get("gir", [])
+            # For hole label, only accept 1-9 for front
+            if current_label == "hole":
+                if isinstance(val, int) and 1 <= val <= 9:
+                    front["hole"].append(val)
+                elif isinstance(val, int) and val == 10:
+                    # We've hit the back 9 hole numbers
+                    back9_start_idx = line_idx
+                    current_label = None
+                # else skip (summary totals etc.)
+            else:
+                front[current_label].append(val)
 
-        # Strip summary totals (every 10th value after each set of 9)
-        def strip_summaries(vals, hole_count_per_nine=9):
-            result = []
-            count = 0
-            for v in vals:
-                count += 1
-                if count == hole_count_per_nine + 1:
-                    count = 0
+        # Strip the summary total from each front 9 stat row (the 10th value = Out total)
+        for label in ["par", "score", "putts"]:
+            if len(front[label]) > len(front["hole"]):
+                front[label] = front[label][:len(front["hole"])]
+
+        logger.debug("Front 9 parsed - holes: %s, par: %s, score: %s, gir: %s, putts: %s",
+                      front["hole"], front["par"], front["score"], front["gir"], front["putts"])
+
+        # === PASS 2: Parse unlabeled back 9 ===
+        back = {k: [] for k in front_labels}
+
+        if back9_start_idx is None:
+            # Try to find the back 9 by looking for "10" after the Putts section
+            for i, line in enumerate(lines):
+                if line.strip() == "10":
+                    back9_start_idx = i
+                    break
+
+        if back9_start_idx is not None:
+            # The back 9 block follows the same stat order as front 9 but without labels:
+            # hole numbers (10-18), then In/Total, then par values, then score values,
+            # then GIR, then putts. We parse by collecting groups of values.
+            back9_lines = lines[back9_start_idx:]
+            groups = []  # list of lists of values
+            current_group = []
+            current_type = "numeric"  # track what kind of group we're in
+
+            for line in back9_lines:
+                stripped = line.strip()
+                low = stripped.lower()
+
+                # Stop if we hit the Stats/Badges section
+                if low in ("eagle or better", "birdie", "stats", "badges",
+                           "exclude this scorecard"):
+                    if current_group:
+                        groups.append(current_group)
+                    break
+
+                # Skip summary words
+                if low in summary_words:
                     continue
-                result.append(v)
-            return result
 
-        if len(par_vals) > len(hole_nums):
-            par_vals = strip_summaries(par_vals)
-        if len(score_vals) > len(hole_nums):
-            score_vals = strip_summaries(score_vals)
-        if len(putts_vals) > len(hole_nums):
-            putts_vals = strip_summaries(putts_vals)
+                # Skip fraction summaries
+                if re.match(r'^\d+/\d+$', stripped):
+                    continue
 
-        logger.debug("Parsed rows - holes: %s, par: %s, score: %s, putts: %s, gir: %s",
-                      hole_nums, par_vals, score_vals, putts_vals, gir_vals)
+                # Skip blank lines
+                if not stripped:
+                    continue
+
+                # Try to parse as a value
+                # For GIR detection, check if it's a checkmark/X
+                is_gir_val = (stripped in ("\u2713", "\u2714", "\u2705", "Y", "y", "✓", "✔",
+                                           "X", "x", "\u2717", "\u2718", "✗", "✘")
+                              or "✓" in stripped or "✔" in stripped
+                              or "✕" in stripped or "✖" in stripped)
+                is_dash = stripped == "—"
+                is_number = stripped.isdigit()
+
+                if is_gir_val or is_dash or is_number:
+                    # Determine group type
+                    if is_gir_val and current_type != "gir":
+                        # New GIR group
+                        if current_group:
+                            groups.append(current_group)
+                        current_group = []
+                        current_type = "gir"
+
+                    if current_type == "gir":
+                        val = _parse_value(stripped, "gir")
+                    else:
+                        val = _parse_value(stripped, "numeric")
+
+                    if val != "SKIP":
+                        current_group.append(val)
+                else:
+                    # Non-data line — finalize current group
+                    if current_group:
+                        groups.append(current_group)
+                        current_group = []
+                        current_type = "numeric"
+
+            if current_group:
+                groups.append(current_group)
+
+            # Map groups to stats. Expected order:
+            # Group 0: hole numbers [10, 11, ..., 18]
+            # Group 1: par values [3, 3, ..., 3, 27, 54] (with In total and Grand total)
+            # Group 2: score values [scores or dashes, with totals]
+            # Group 3: GIR values (if present)
+            # Group 4: putts values [putts or dashes, with totals]
+            logger.debug("Back 9 groups: %s", groups)
+
+            for g_idx, group in enumerate(groups):
+                if not group:
+                    continue
+
+                # Identify group by content
+                first_val = group[0]
+
+                if isinstance(first_val, int) and first_val == 10:
+                    # Hole numbers
+                    back["hole"] = [v for v in group if isinstance(v, int) and 10 <= v <= 18]
+                elif isinstance(first_val, bool) or (first_val is None and
+                        any(isinstance(v, bool) for v in group)):
+                    # GIR values (True/False/None)
+                    back["gir"] = group[:len(back["hole"])] if back["hole"] else group[:9]
+                elif back["hole"] and not back["par"]:
+                    # First numeric group after holes = par
+                    back["par"] = group[:len(back["hole"])]
+                elif back["par"] and not back["score"]:
+                    # Second numeric group = score
+                    back["score"] = group[:len(back["hole"])]
+                elif back["score"] and not back["putts"]:
+                    # Check if this is GIR (booleans) or putts (numbers)
+                    if any(isinstance(v, bool) for v in group):
+                        back["gir"] = group[:len(back["hole"])]
+                    else:
+                        back["putts"] = group[:len(back["hole"])]
+
+            logger.debug("Back 9 parsed - holes: %s, par: %s, score: %s, gir: %s, putts: %s",
+                          back["hole"], back["par"], back["score"], back["gir"], back["putts"])
+
+        # === Combine front + back ===
+        hole_nums = front["hole"] + back["hole"]
+        par_vals = front["par"] + back["par"]
+        score_vals = front["score"] + back["score"]
+        gir_vals = front["gir"] + back["gir"]
+        putts_vals = front["putts"] + back["putts"]
+
+        logger.debug("Combined - holes: %s, par: %s, score: %s, gir: %s, putts: %s",
+                      hole_nums, par_vals, score_vals, gir_vals, putts_vals)
 
         # Build hole scores for played holes
         num_holes = min(len(hole_nums), len(par_vals), len(score_vals)) if hole_nums else 0
