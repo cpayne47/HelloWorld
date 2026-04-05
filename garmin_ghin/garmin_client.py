@@ -48,6 +48,12 @@ class GarminClient:
         options.add_argument("--no-service-autorun")
         options.add_argument("--password-store=basic")
 
+        # Use a persistent profile directory so login sessions survive between runs.
+        # This avoids re-entering credentials every time.
+        profile_dir = Path.home() / ".garmin_ghin" / "chrome_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        options.add_argument(f"--user-data-dir={profile_dir}")
+
         # Auto-detect Chrome version to avoid driver mismatch
         chrome_version = None
         try:
@@ -74,29 +80,43 @@ class GarminClient:
 
         # Check if we landed on the scorecards page or got redirected to SSO
         if "sso.garmin.com" in driver.current_url:
-            logger.info("Not logged in, performing login...")
+            logger.info("Not logged in, redirected to SSO: %s", driver.current_url)
+            print("Logging in with credentials from .env...")
             try:
+                # Wait for the login form to be ready
+                time.sleep(3)
+
                 email_field = driver.find_element("id", "username")
                 email_field.clear()
                 email_field.send_keys(self._config.email)
+                logger.info("Entered email: %s", self._config.email)
 
                 pw_field = driver.find_element("id", "password")
                 pw_field.clear()
                 pw_field.send_keys(self._config.password)
+                logger.info("Entered password (length %d)", len(self._config.password))
 
                 login_btn = driver.find_element("id", "login-btn-signin")
                 login_btn.click()
+                logger.info("Clicked sign-in button")
 
                 # Wait for redirect back to connect.garmin.com
-                for _ in range(30):
+                for i in range(30):
                     time.sleep(2)
-                    if "connect.garmin.com" in driver.current_url:
+                    current = driver.current_url
+                    if "connect.garmin.com" in current:
+                        logger.info("Login successful after %ds, at: %s", (i+1)*2, current)
                         break
+                    logger.debug("Waiting for redirect... (%ds) at: %s", (i+1)*2, current)
                 else:
-                    print("Login timed out. Check browser for MFA or CAPTCHA.", file=sys.stderr)
-                    raise SystemExit(1)
+                    print(
+                        "Login redirect timed out after 60s.\n"
+                        "Check the browser — there may be a CAPTCHA or MFA prompt.\n"
+                        "Once you're logged in, press Enter here...",
+                        file=sys.stderr,
+                    )
+                    input()
 
-                logger.info("Login successful, redirected to: %s", driver.current_url)
                 # Navigate to scorecards after login
                 driver.get(GARMIN_SCORECARDS_URL)
                 time.sleep(5)
