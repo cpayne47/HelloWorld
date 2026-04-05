@@ -434,43 +434,59 @@ class GarminClient:
                       [(t, v) for t, v in tokens[:80]])
 
         # === Split into labeled front-9 sections ===
+        # Each label gets at most 9 data values (front 9 only).
+        # Once a label has 9 values, additional data is NOT consumed —
+        # that's the back 9 (unlabeled).
         front = {}  # label -> list of values
         current_label = None
-        last_label_data_idx = 0
+        label_full = False  # True when current label has 9 values
+        last_consumed_idx = 0  # last token index we actually consumed
 
         for i, (ttype, tval) in enumerate(tokens):
             if ttype == "label":
                 current_label = tval
+                label_full = False
                 if current_label not in front:
                     front[current_label] = []
-                last_label_data_idx = i
+                last_consumed_idx = i
                 continue
             if current_label is None:
                 continue
-            if ttype in ("summary", "frac"):
+            if label_full:
+                # This label already has 9 values — don't consume more
                 continue
-            # For labels we care about, collect nums and dashes
-            # For labels we skip, consume the data (symbols, nums, dashes)
+            if ttype in ("summary", "frac"):
+                last_consumed_idx = i
+                continue
+            # Data value (num, dash, symbol)
             front[current_label].append(tval)
-            last_label_data_idx = i
-
-        # Trim each section to 9 values max (front 9 only)
-        for label in front:
-            if len(front[label]) > 9:
-                front[label] = front[label][:9]
+            last_consumed_idx = i
+            if len(front[current_label]) >= 9:
+                label_full = True
 
         logger.debug("Front 9 sections:")
         for label, vals in front.items():
             logger.debug("  %s (%d): %s", label, len(vals), vals)
+        logger.debug("Last consumed token idx: %d of %d", last_consumed_idx, len(tokens))
 
         # === Parse back 9 from remaining tokens ===
-        # Find first "num" token with value 10 after labeled sections
+        # Find the sequence 10, 11, 12... which marks the back 9 hole numbers.
+        # We look for num==10 followed by num==11 to avoid false matches
+        # (e.g. a summary total of 10).
         back9_start = None
-        for i in range(last_label_data_idx + 1, len(tokens)):
+        for i in range(last_consumed_idx + 1, len(tokens) - 1):
             ttype, tval = tokens[i]
             if ttype == "num" and tval == 10:
-                back9_start = i
-                break
+                # Verify next numeric token is 11
+                for j in range(i + 1, min(i + 3, len(tokens))):
+                    jtype, jval = tokens[j]
+                    if jtype == "num" and jval == 11:
+                        back9_start = i
+                        break
+                    elif jtype == "num":
+                        break  # next number isn't 11 — false match
+                if back9_start is not None:
+                    break
 
         back_par = []
         back_score = []
