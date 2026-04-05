@@ -57,21 +57,37 @@ class GarminClient:
             "Di-Backend": "connectapi.garmin.com",
         })
 
-        # Verify session is valid
-        resp = session.get(f"{GARMIN_API}/userprofile-service/usersocial/profile")
-        if resp.status_code in (401, 403):
+        # Verify session is valid — try multiple known profile endpoints
+        profile_urls = [
+            f"{GARMIN_API}/proxy/userprofile-service/usersocial/profile",
+            f"{GARMIN_API}/userprofile-service/usersocial/profile",
+            f"{GARMIN_API}/proxy/userprofile-service/socialProfile",
+        ]
+        resp = None
+        for url in profile_urls:
+            resp = session.get(url)
+            if resp.status_code == 200:
+                break
+            logger.debug("Profile endpoint %s returned %d", url, resp.status_code)
+
+        if resp is None or resp.status_code in (401, 403):
             print(
                 "Saved session has expired. Log in again:\n\n"
-                "  python -m garmin_ghin.cli login --paste\n"
-                "  python -m garmin_ghin.cli login --chrome\n",
+                "  python -m garmin_ghin.cli login --file cookie.txt\n",
                 file=sys.stderr,
             )
             raise SystemExit(1)
-        resp.raise_for_status()
 
-        profile = resp.json()
-        display_name = profile.get("displayName", "Unknown")
-        logger.info("Garmin: authenticated as %s", display_name)
+        if resp.status_code == 200:
+            try:
+                profile = resp.json()
+                display_name = profile.get("displayName", profile.get("userName", "Unknown"))
+                logger.info("Garmin: authenticated as %s", display_name)
+            except Exception:
+                logger.info("Garmin: session appears valid (got 200)")
+        else:
+            # Non-auth error but session might still work — continue anyway
+            logger.warning("Profile check returned %d, proceeding anyway", resp.status_code)
 
         self._session = session
         return session
@@ -83,7 +99,7 @@ class GarminClient:
         end = date.today().isoformat()
 
         resp = session.get(
-            f"{GARMIN_API}/activitylist-service/activities/search/activities",
+            f"{GARMIN_API}/proxy/activitylist-service/activities/search/activities",
             params={
                 "activityType": self.GOLF_ACTIVITY_TYPE,
                 "startDate": start,
@@ -102,13 +118,13 @@ class GarminClient:
         session = self._ensure_connected()
 
         # Get activity summary
-        resp = session.get(f"{GARMIN_API}/activity-service/activity/{activity_id}")
+        resp = session.get(f"{GARMIN_API}/proxy/activity-service/activity/{activity_id}")
         resp.raise_for_status()
         activity = resp.json()
 
         # Get scorecard data
         resp = session.get(
-            f"{GARMIN_API}/gcs-golfcommunity/api/v2/scorecard/activity/{activity_id}/details"
+            f"{GARMIN_API}/proxy/gcs-golfcommunity/api/v2/scorecard/activity/{activity_id}/details"
         )
         resp.raise_for_status()
         scorecard_data = resp.json()
