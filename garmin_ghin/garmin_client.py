@@ -95,23 +95,59 @@ class GarminClient:
     def get_recent_golf_rounds(self, days_back: int = 30) -> list[dict]:
         """Fetch golf activities from the last N days."""
         session = self._ensure_connected()
+
+        # Try the golf-specific scorecard list endpoint first
+        resp = session.get(
+            f"{GARMIN_API}/proxy/gcs-golfcommunity/api/v2/scorecard/list",
+            params={"limit": 50},
+        )
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                scorecards = data if isinstance(data, list) else data.get("scorecardList", data.get("scorecards", []))
+                logger.info("Garmin golf API: found %d scorecards", len(scorecards))
+                if scorecards:
+                    return scorecards
+            except Exception as e:
+                logger.debug("Golf scorecard list parse failed: %s", e)
+
+        # Fallback: general activity search
         start = (date.today() - timedelta(days=days_back)).isoformat()
         end = date.today().isoformat()
 
+        # First try without activityType filter to see what's there
         resp = session.get(
             f"{GARMIN_API}/proxy/activitylist-service/activities/search/activities",
             params={
-                "activityType": self.GOLF_ACTIVITY_TYPE,
                 "startDate": start,
                 "endDate": end,
                 "limit": 50,
             },
         )
         resp.raise_for_status()
-        activities = resp.json()
+        all_activities = resp.json()
+        logger.info("Garmin: found %d total activities in last %d days", len(all_activities), days_back)
 
-        logger.info("Garmin: found %d golf activities in last %d days", len(activities), days_back)
-        return activities
+        # Filter for golf activities
+        golf_activities = []
+        for act in all_activities:
+            act_type = act.get("activityType", {})
+            type_key = act_type.get("typeKey", "") if isinstance(act_type, dict) else str(act_type)
+            logger.debug("Activity: %s, type: %s", act.get("activityName"), type_key)
+            if "golf" in type_key.lower():
+                golf_activities.append(act)
+
+        if not golf_activities and all_activities:
+            # Log what types we did find so we can debug
+            types_found = set()
+            for act in all_activities:
+                act_type = act.get("activityType", {})
+                type_key = act_type.get("typeKey", "") if isinstance(act_type, dict) else str(act_type)
+                types_found.add(type_key)
+            logger.info("Activity types found (no golf): %s", types_found)
+
+        logger.info("Garmin: found %d golf activities in last %d days", len(golf_activities), days_back)
+        return golf_activities
 
     def get_scorecard(self, activity_id: int) -> Scorecard:
         """Fetch full scorecard details for a golf activity."""
