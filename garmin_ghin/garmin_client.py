@@ -237,80 +237,192 @@ class GarminClient:
         return self._parse_scorecard_page(driver, scorecard_id, page_text)
 
     def _parse_scorecard_page(self, driver, scorecard_id: str, page_text: str) -> Scorecard:
-        """Extract scorecard data from the rendered HTML page."""
+        """Extract scorecard data from the rendered HTML page.
 
-        # Extract course name
-        course_name = "Unknown Course"
-        for selector in ["h1", "h2", "[class*='course']", "[class*='Course']", "[class*='title']"]:
-            try:
-                el = driver.find_element("css selector", selector)
-                if el.text.strip():
-                    course_name = el.text.strip()
-                    break
-            except Exception:
-                continue
-
-        # Try to extract date from page text
-        date_played = date.today()
+        Garmin uses a row-per-stat layout (not row-per-hole):
+            Hole   1  2  3 ... 9  Out  10 ... 18  In  Total
+            Par    3  3  4 ...
+            Score  4  4  5 ...
+            Putts  2  1  3 ...
+        """
         import re
-        date_patterns = [
-            r'(\w+ \d{1,2}, \d{4})',  # Apr 4, 2026
-            r'(\d{1,2}/\d{1,2}/\d{4})',  # 4/4/2026
-            r'(\d{4}-\d{2}-\d{2})',  # 2026-04-04
-        ]
-        for pattern in date_patterns:
+
+        lines = page_text.split("\n")
+
+        # Extract course name from the first few non-empty lines
+        # Typically: "Scorecards", "Desert Mountain", "No 7", "Apr 4, 2026"
+        course_name = "Unknown Course"
+        non_empty = [l.strip() for l in lines if l.strip()]
+        for i, line in enumerate(non_empty):
+            # Skip navigation/header text
+            if line.lower() in ("scorecards", "stroke play", "men's tees",
+                                "women's tees", "hole", "par", "score", "putts",
+                                "gir", "stats", "badges"):
+                continue
+            # Skip date lines
+            if re.match(r'\w+ \d{1,2}, \d{4}', line):
+                continue
+            # Skip single numbers
+            if re.match(r'^\d+$', line):
+                continue
+            # First meaningful line is likely the course name
+            course_name = line
+            # Check if next line is a course/tee variant (e.g., "No 7")
+            if i + 1 < len(non_empty):
+                next_line = non_empty[i + 1]
+                if not re.match(r'\w+ \d{1,2}, \d{4}', next_line) and \
+                   next_line.lower() not in ("stroke play", "men's tees", "women's tees") and \
+                   not re.match(r'^\d+$', next_line) and \
+                   len(next_line) < 20:
+                    course_name = f"{course_name} - {next_line}"
+            break
+
+        # Extract date
+        date_played = date.today()
+        for pattern, fmts in [
+            (r'(\w+ \d{1,2}, \d{4})', ["%B %d, %Y", "%b %d, %Y"]),
+            (r'(\d{1,2}/\d{1,2}/\d{4})', ["%m/%d/%Y"]),
+            (r'(\d{4}-\d{2}-\d{2})', ["%Y-%m-%d"]),
+        ]:
             match = re.search(pattern, page_text)
             if match:
-                try:
-                    for fmt in ["%B %d, %Y", "%b %d, %Y", "%m/%d/%Y", "%Y-%m-%d"]:
-                        try:
-                            date_played = datetime.strptime(match.group(1), fmt).date()
-                            break
-                        except ValueError:
-                            continue
-                except Exception:
-                    pass
+                for fmt in fmts:
+                    try:
+                        date_played = datetime.strptime(match.group(1), fmt).date()
+                        break
+                    except ValueError:
+                        continue
                 if date_played != date.today():
                     break
+
+        # Extract tee name
+        tee_name = None
+        for line in non_empty:
+            if "tees" in line.lower() and line.lower() not in ("men's tees", "women's tees"):
+                continue
+            if line.lower() in ("men's tees", "women's tees"):
+                tee_name = line
+                break
 
         scorecard = Scorecard(
             garmin_activity_id=0,
             course_name=course_name,
             date_played=date_played,
+            tee_name=tee_name,
         )
 
-        # Strategy 1: Look for table rows with hole data
-        try:
-            rows = driver.find_elements("css selector", "table tr")
-            for row in rows:
-                cells = row.find_elements("css selector", "td, th")
-                if len(cells) >= 3:
-                    try:
-                        texts = [c.text.strip() for c in cells]
-                        hole_num = int(texts[0])
-                        if 1 <= hole_num <= 18:
-                            par = int(texts[1]) if texts[1].isdigit() else 4
-                            score = int(texts[2]) if texts[2].isdigit() else 0
-                            putts = int(texts[3]) if len(texts) > 3 and texts[3].isdigit() else None
-                            scorecard.holes.append(HoleScore(
-                                hole_number=hole_num,
-                                par=par,
-                                score=score,
-                                putts=putts,
-                            ))
-                    except (ValueError, IndexError):
-                        continue
-        except Exception as e:
-            logger.debug("Table parsing failed: %s", e)
+        # Parse the row-per-stat layout from page text.
+        # Garmin renders each cell on its own line:
+        #   Hole / 1 / 2 / ... / 9 / Out / Par / 3 / 3 / ... / 27 / Score / 4 / ...
+        # We need to find each label and collect values up to the next label or summary.
+        #
+        # The page has two blocks (front 9 and back 9) with the same label sequence.
+        # We parse all values per label across both blocks.
 
-        # Strategy 2: Parse numbers from page text if no table found
-        if not scorecard.holes:
-            logger.info("No table found, trying text-based extraction")
-            # Look for patterns like hole numbers followed by scores
-            lines = page_text.split("\n")
-            logger.debug("Page has %d lines of text", len(lines))
-            for line in lines:
-                logger.debug("  Line: %s", line[:100])
+        labels = {"hole", "par", "score", "gir", "putts"}
+        summary_labels = {"out", "in", "total"}
+
+        # Collect all values grouped by label, in order of appearance
+        # Each label can appear twice (front 9 + back 9)
+        all_rows = {}  # label -> list of values (combined front+back)
+        current_label = None
+
+        for line in lines:
+            stripped = line.strip()
+            low = stripped.lower()
+
+            if low in labels:
+                current_label = low
+                if current_label not in all_rows:
+                    all_rows[current_label] = []
+                continue
+
+            if current_label is None:
+                continue
+
+            # Skip summary labels and their totals
+            if low in summary_labels:
+                # The next number after Out/In/Total is a summary — skip it
+                continue
+
+            # Skip GIR-style stats like "6/9"
+            if re.match(r'^\d+/\d+$', stripped):
+                continue
+
+            # Skip non-data lines (new section labels, badge names, etc.)
+            if stripped == "—":
+                all_rows[current_label].append(None)
+            elif stripped.isdigit():
+                val = int(stripped)
+                # Filter out summary totals: if this is hole row, only 1-18
+                if current_label == "hole":
+                    if 1 <= val <= 18:
+                        all_rows[current_label].append(val)
+                    # else it's a summary total, skip
+                else:
+                    all_rows[current_label].append(val)
+            else:
+                # Hit a non-numeric, non-label line — end of this label's data
+                # But only if we already have values (avoid stopping on blank lines)
+                if all_rows.get(current_label):
+                    current_label = None
+
+        hole_nums = all_rows.get("hole", [])
+        par_vals = all_rows.get("par", [])
+        score_vals = all_rows.get("score", [])
+        putts_vals = all_rows.get("putts", [])
+
+        # The par/score/putts rows include summary totals (Out, In, Total sums).
+        # Since we skipped summary labels, the totals that follow them should also
+        # be skipped. But our skip logic only skips the label, not the number.
+        # Fix: trim par/score/putts to match the number of holes.
+        # For front 9: 9 holes -> par has 9 values + 1 summary = 10. Back 9 similar.
+        # We align by using hole_nums as the reference length.
+
+        # Actually, let's be smarter: pair values positionally with hole numbers.
+        # Remove summary values from par/score/putts by keeping only as many
+        # values as we have hole numbers, removing every 10th value (the summary).
+        def strip_summaries(vals, hole_count_per_nine=9):
+            """Remove the summary value that appears after every 9 holes."""
+            result = []
+            count = 0
+            for v in vals:
+                count += 1
+                if count == hole_count_per_nine + 1:
+                    # This is the Out/In/Total summary — skip it
+                    count = 0
+                    continue
+                result.append(v)
+            return result
+
+        if len(par_vals) > len(hole_nums):
+            par_vals = strip_summaries(par_vals)
+        if len(score_vals) > len(hole_nums):
+            score_vals = strip_summaries(score_vals)
+        if len(putts_vals) > len(hole_nums):
+            putts_vals = strip_summaries(putts_vals)
+
+        logger.debug("Parsed rows - holes: %s, par: %s, score: %s, putts: %s",
+                      hole_nums, par_vals, score_vals, putts_vals)
+
+        # Build hole scores from the extracted rows
+        num_holes = min(len(hole_nums), len(par_vals), len(score_vals)) if hole_nums else 0
+        for i in range(num_holes):
+            hole_num = hole_nums[i]
+            if not isinstance(hole_num, int) or hole_num < 1 or hole_num > 18:
+                continue
+            par = par_vals[i] if par_vals[i] is not None else 4
+            score = score_vals[i] if score_vals[i] is not None else 0
+            if score == 0:
+                continue  # Skip unplayed holes
+            putts = putts_vals[i] if i < len(putts_vals) and putts_vals[i] is not None else None
+
+            scorecard.holes.append(HoleScore(
+                hole_number=hole_num,
+                par=par,
+                score=score,
+                putts=putts,
+            ))
 
         if not scorecard.holes:
             # Save for debugging
