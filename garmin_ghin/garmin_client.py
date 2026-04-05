@@ -48,8 +48,23 @@ class GarminClient:
         options.add_argument("--no-service-autorun")
         options.add_argument("--password-store=basic")
 
+        # Auto-detect Chrome version to avoid driver mismatch
+        chrome_version = None
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "--version"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                # Output like "Google Chrome 146.0.7680.178"
+                chrome_version = int(result.stdout.strip().split()[-1].split(".")[0])
+                logger.info("Detected Chrome version: %d", chrome_version)
+        except Exception as e:
+            logger.debug("Could not detect Chrome version: %s", e)
+
         logger.info("Launching Chrome...")
-        driver = uc.Chrome(options=options, headless=False)
+        driver = uc.Chrome(options=options, headless=False, version_main=chrome_version)
         self._driver = driver
         return driver
 
