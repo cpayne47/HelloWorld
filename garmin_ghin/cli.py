@@ -11,6 +11,16 @@ def cmd_login(args) -> None:
 
     if args.chrome:
         import_from_chrome()
+    elif args.file:
+        from pathlib import Path
+        cookie_string = Path(args.file).read_text().strip()
+        if not cookie_string:
+            print("File is empty.")
+            sys.exit(1)
+        # Strip "Cookie: " prefix if present
+        if cookie_string.lower().startswith("cookie:"):
+            cookie_string = cookie_string.split(":", 1)[1].strip()
+        save_cookie_string(cookie_string)
     elif args.paste:
         print("Paste your Cookie header value from browser dev tools,")
         print("then press Enter:\n")
@@ -21,8 +31,9 @@ def cmd_login(args) -> None:
         save_cookie_string(cookie_string)
     else:
         print("Specify a method:\n")
-        print("  python -m garmin_ghin.cli login --paste   (paste from dev tools)")
-        print("  python -m garmin_ghin.cli login --chrome  (auto-read from Chrome)")
+        print("  python -m garmin_ghin.cli login --file cookie.txt  (read from file)")
+        print("  python -m garmin_ghin.cli login --chrome            (auto-read from Chrome)")
+        print("  python -m garmin_ghin.cli login --paste             (paste interactively)")
 
 
 def cmd_scorecard(args) -> None:
@@ -64,7 +75,8 @@ def main() -> None:
 
     # login subcommand
     login_parser = subparsers.add_parser("login", help="Import Garmin session cookies")
-    login_parser.add_argument("--paste", action="store_true", help="Paste cookie string from dev tools")
+    login_parser.add_argument("--file", type=str, help="Read cookies from a text file")
+    login_parser.add_argument("--paste", action="store_true", help="Paste cookie string interactively")
     login_parser.add_argument("--chrome", action="store_true", help="Auto-read from Chrome browser")
 
     # scorecard subcommand
