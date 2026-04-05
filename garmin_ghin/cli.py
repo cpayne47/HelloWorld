@@ -27,22 +27,31 @@ def cmd_scorecard(args) -> None:
         for i, act in enumerate(activities[:5]):
             sc_id = act.get("scorecardId", act.get("activityId", "?"))
             text = act.get("text", act.get("activityName", ""))
-            print(f"  [{i+1}] {sc_id}  {text[:60]}")
+            stats = act.get("stats", [])
+            stats_str = f"  [{', '.join(stats)}]" if stats else ""
+            print(f"  [{i+1}] {text[:60]}{stats_str}")
+            if act.get("href"):
+                print(f"       -> {act['href']}")
 
         # Fetch the most recent
         latest = activities[0]
         sc_id = latest.get("scorecardId", latest.get("activityId"))
+        href = latest.get("href", "")
 
-        if sc_id:
-            print(f"\nFetching scorecard {sc_id}...\n")
-            scorecard = client.get_scorecard(sc_id)
+        if sc_id or href:
+            print(f"\nFetching scorecard details...\n")
+            scorecard = client.get_scorecard(sc_id or "", href=href)
             print(scorecard.summary())
 
             issues = scorecard.validate()
             if not issues:
                 print("\nScorecard looks good!")
+            else:
+                print("\nValidation issues:")
+                for issue in issues:
+                    print(f"  - {issue}")
         else:
-            print("\nCould not determine scorecard ID from first result.")
+            print("\nCould not determine scorecard ID or URL from first result.")
             print(f"Raw data: {latest}")
 
     finally:

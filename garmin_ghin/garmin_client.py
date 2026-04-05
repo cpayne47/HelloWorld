@@ -18,7 +18,7 @@ from .scorecard import HoleScore, Scorecard
 
 logger = logging.getLogger(__name__)
 
-GARMIN_SCORECARDS_URL = "https://connect.garmin.com/app/scorecards"
+GARMIN_SCORECARDS_URL = "https://connect.garmin.com/app/my-scorecards"
 GARMIN_LOGIN_URL = "https://sso.garmin.com/sso/signin"
 
 
@@ -128,35 +128,83 @@ class GarminClient:
         logger.debug("Page URL: %s", driver.current_url)
         logger.debug("Page text (first 2000 chars):\n%s", page_text[:2000])
 
-        # Find all scorecard links on the page
+        # Find scorecard entries using Garmin's React CSS module classes
         scorecards = []
 
-        # Try finding links to individual scorecards
-        links = driver.find_elements("css selector", "a[href*='scorecard']")
-        if not links:
-            links = driver.find_elements("css selector", "a[href*='golf']")
-        if not links:
-            # Broader: any clickable card-like elements
-            links = driver.find_elements("css selector", "a")
+        # Strategy 1: Use the known CSS class for golf list items
+        items = driver.find_elements("css selector", "[class*='GolfList_listItem']")
+        logger.info("Found %d GolfList items", len(items))
 
-        logger.info("Found %d links on scorecards page", len(links))
+        for item in items:
+            try:
+                # Extract the link (the item itself or a child <a>)
+                link = None
+                if item.tag_name == "a":
+                    link = item
+                else:
+                    links_in_item = item.find_elements("css selector", "a")
+                    if links_in_item:
+                        link = links_in_item[0]
 
-        for link in links:
-            href = link.get_attribute("href") or ""
-            text = link.text.strip()
-            if not text:
+                href = (link.get_attribute("href") if link else "") or ""
+
+                # Extract title and subtitle
+                title = ""
+                subtitle = ""
+                try:
+                    title_el = item.find_element("css selector", "[class*='GolfList_title']")
+                    title = title_el.text.strip()
+                except Exception:
+                    pass
+                try:
+                    sub_el = item.find_element("css selector", "[class*='GolfList_subTitle']")
+                    subtitle = sub_el.text.strip()
+                except Exception:
+                    pass
+
+                # Extract stats (score, putts, etc.)
+                stats = []
+                try:
+                    stat_els = item.find_elements("css selector", "[class*='GolfList_stat']")
+                    stats = [s.text.strip() for s in stat_els if s.text.strip()]
+                except Exception:
+                    pass
+
+                text = f"{title} - {subtitle}" if subtitle else title
+                if not text:
+                    text = item.text.strip()[:80]
+
+                # Extract scorecard ID from href
+                scorecard_id = href.rstrip("/").split("/")[-1] if href else ""
+
+                if text or href:
+                    scorecards.append({
+                        "scorecardId": scorecard_id,
+                        "text": text,
+                        "href": href,
+                        "stats": stats,
+                    })
+                    logger.debug("Found scorecard: %s -> %s (stats: %s)", text[:50], href, stats)
+            except Exception as e:
+                logger.debug("Error parsing list item: %s", e)
                 continue
 
-            # Look for scorecard-related links
-            if any(kw in href.lower() for kw in ["scorecard", "golf", "activity"]):
-                # Extract scorecard ID (UUID or numeric)
-                scorecard_id = href.rstrip("/").split("/")[-1]
-                scorecards.append({
-                    "scorecardId": scorecard_id,
-                    "text": text,
-                    "href": href,
-                })
-                logger.debug("Found scorecard link: %s -> %s", text[:50], href)
+        # Strategy 2: Fall back to finding any scorecard/golf links
+        if not scorecards:
+            logger.info("No GolfList items found, falling back to link search")
+            links = driver.find_elements("css selector", "a[href*='scorecard'], a[href*='golf']")
+            logger.info("Found %d scorecard/golf links", len(links))
+            for link in links:
+                href = link.get_attribute("href") or ""
+                text = link.text.strip()
+                if text and href:
+                    scorecard_id = href.rstrip("/").split("/")[-1]
+                    scorecards.append({
+                        "scorecardId": scorecard_id,
+                        "text": text,
+                        "href": href,
+                    })
+                    logger.debug("Found scorecard link: %s -> %s", text[:50], href)
 
         if not scorecards:
             logger.warning("No scorecard links found. Page text:\n%s", page_text[:3000])
@@ -167,12 +215,19 @@ class GarminClient:
 
         return scorecards
 
-    def get_scorecard(self, scorecard_id: str) -> Scorecard:
+    def get_scorecard(self, scorecard_id: str, href: str = "") -> Scorecard:
         """Navigate to a specific scorecard and extract hole-by-hole data."""
         driver = self._ensure_browser()
 
-        # Navigate to the scorecard detail page
-        url = f"https://connect.garmin.com/app/scorecards/{scorecard_id}"
+        # Navigate to the scorecard detail page using the discovered href if available
+        if href and href.startswith("http"):
+            url = href
+        elif href and href.startswith("/"):
+            url = f"https://connect.garmin.com{href}"
+        else:
+            # Best guess - try the scorecard ID as a path segment
+            url = f"https://connect.garmin.com/app/my-scorecards/{scorecard_id}"
+        logger.info("Navigating to scorecard: %s", url)
         driver.get(url)
         time.sleep(5)
 
