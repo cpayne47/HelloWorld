@@ -14,7 +14,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from .config import GarminConfig
-from .course_db import get_correct_pars, get_ghin_name, get_tee_label
+from .course_db import get_correct_pars, get_ghin_name, get_tee_box
 from .scorecard import HoleScore, Scorecard
 
 logger = logging.getLogger(__name__)
@@ -452,12 +452,12 @@ class GarminClient:
             logger.warning("Could not extract hole data. HTML saved to %s", debug_file)
             print(f"\nPage text:\n{page_text[:2000]}")
 
-        # Apply correct pars from course database (Garmin's pars are often wrong)
-        tee = scorecard.tee_name or ""
-        correct_pars = get_correct_pars(scorecard.course_name, tee)
+        # Apply correct pars from course database (Garmin's pars can be wrong)
+        garmin_tee = scorecard.tee_name or ""
+        correct_pars = get_correct_pars(scorecard.course_name)
         if correct_pars:
-            logger.info("Applying corrected pars from course database for '%s' / '%s'",
-                        scorecard.course_name, tee)
+            logger.info("Applying corrected pars from course database for '%s'",
+                        scorecard.course_name)
             for i, hole in enumerate(scorecard.holes):
                 if i < len(correct_pars):
                     old_par = hole.par
@@ -465,20 +465,19 @@ class GarminClient:
                     if old_par != hole.par:
                         logger.debug("Hole %d: par %d -> %d", hole.hole_number, old_par, hole.par)
 
-            # Update GHIN course name if available
+            # Map Garmin tee name to actual tee box (e.g. Men's Tees -> T3)
+            tee_box = get_tee_box(scorecard.course_name, garmin_tee)
+            if tee_box:
+                scorecard.tee_name = tee_box
+                logger.info("Mapped '%s' -> %s", garmin_tee, tee_box)
+
+            # Update to GHIN course name if available
             ghin_name = get_ghin_name(scorecard.course_name)
             if ghin_name:
                 scorecard.course_name = ghin_name
-
-            # Add tee label for display
-            label = get_tee_label(scorecard.course_name, tee)
-            if not label:
-                label = get_tee_label(ghin_name or scorecard.course_name, tee)
-            if label:
-                scorecard.tee_name = f"{tee} ({label})"
         else:
-            logger.info("No course database entry for '%s' / '%s' — using Garmin pars",
-                        scorecard.course_name, tee)
+            logger.info("No course database entry for '%s' — using Garmin pars",
+                        scorecard.course_name)
 
         return scorecard
 
