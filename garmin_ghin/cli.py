@@ -148,24 +148,21 @@ def cmd_history(args) -> None:
         print(sc.summary())
         return
 
-    print(f"{'ID':>4}  {'Date':<12} {'Course':<30} {'Tee':<5} {'Nine':<6} "
-          f"{'Score':>5} {'vs Par':>6} {'Putts':>5} {'GIR':<5}")
-    print("-" * 95)
+    print(f"{'ID':>4}  {'Date':<12} {'Course':<30} {'Par':>4} {'Score':>5} {'Holes':<5}")
+    print("-" * 68)
 
     for sc in scorecards:
         nine = sc.get("nine_played", "")
-        nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
-        vs_par = sc.get("score_vs_par")
-        vs_par_str = f"{vs_par:+d}" if vs_par is not None else "-"
-        putts = sc.get("total_putts")
-        putts_str = str(putts) if putts is not None else "-"
-        gir = sc.get("gir_summary") or "-"
+        nine_label = {"front": "Front 9", "back": "Back 9", "both": "18"}.get(nine, "?")
+        total = sc.get("total_score")
+        total_str = str(total) if total is not None else "-"
+        # Par for holes played
+        par = sc.get("total_score", 0) - sc.get("score_vs_par", 0) if sc.get("score_vs_par") is not None else None
+        par_str = str(par) if par is not None else "-"
 
-        print(f"{sc['id']:>4}  {sc['date_played']:<12} {sc['course_name']:<30} "
-              f"{(sc.get('tee_name') or '-'):<5} {nine_label:<6} "
-              f"{sc.get('total_score') or '-':>5} {vs_par_str:>6} {putts_str:>5} {gir:<5}")
+        print(f"{sc['id']:>4}  {sc['date_played']:<12} {sc['course_name']:<30} {par_str:>4} {total_str:>5} {nine_label:<5}")
 
-    print(f"\n{len(scorecards)} scorecard(s). Use 'history --id N' to see details.")
+    print(f"\n{len(scorecards)} round(s). Use 'history --id N' for full scorecard.")
 
 
 def main() -> None:
