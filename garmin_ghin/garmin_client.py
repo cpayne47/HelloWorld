@@ -1,30 +1,25 @@
 """Garmin Connect client for retrieving golf round data.
 
-Uses browser-based auth (Playwright) to bypass Cloudflare TLS fingerprinting,
-then makes API calls using requests with the captured session cookies.
+Uses cookies from a real browser session to authenticate API requests.
 """
 
-import json
 import logging
 import sys
 from datetime import date, datetime, timedelta
-from pathlib import Path
 
 import requests
 
+from .auth import has_saved_cookies, load_cookies
 from .config import GarminConfig
 from .scorecard import HoleScore, Scorecard
 
 logger = logging.getLogger(__name__)
 
-TOKEN_DIR = Path(__file__).resolve().parent.parent / "token_store"
-AUTH_FILE = TOKEN_DIR / "browser_auth.json"
-
 GARMIN_API = "https://connect.garmin.com"
 
 
 class GarminClient:
-    """Fetches golf data from Garmin Connect using browser-captured session."""
+    """Fetches golf data from Garmin Connect using browser session cookies."""
 
     GOLF_ACTIVITY_TYPE = "golf"
 
@@ -36,28 +31,23 @@ class GarminClient:
         if self._session is not None:
             return self._session
 
-        if not AUTH_FILE.exists():
+        if not has_saved_cookies():
             print(
                 "No saved Garmin session found.\n"
-                "Run browser login first:\n\n"
-                "  python -m garmin_ghin.browser_login\n",
+                "Run login first:\n\n"
+                "  python -m garmin_ghin.cli login --paste\n"
+                "  python -m garmin_ghin.cli login --chrome\n",
                 file=sys.stderr,
             )
             raise SystemExit(1)
 
-        auth_data = json.loads(AUTH_FILE.read_text())
+        cookies = load_cookies()
         session = requests.Session()
 
-        # Load cookies from browser capture
-        for cookie in auth_data.get("cookies", []):
-            session.cookies.set(
-                cookie["name"],
-                cookie["value"],
-                domain=cookie.get("domain", ""),
-                path=cookie.get("path", "/"),
-            )
+        for name, value in cookies.items():
+            session.cookies.set(name, value, domain=".garmin.com")
 
-        # Set headers to look like a browser
+        # Headers to look like a normal browser request
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -69,10 +59,11 @@ class GarminClient:
 
         # Verify session is valid
         resp = session.get(f"{GARMIN_API}/userprofile-service/usersocial/profile")
-        if resp.status_code == 401 or resp.status_code == 403:
+        if resp.status_code in (401, 403):
             print(
-                "Saved session has expired. Re-run browser login:\n\n"
-                "  python -m garmin_ghin.browser_login\n",
+                "Saved session has expired. Log in again:\n\n"
+                "  python -m garmin_ghin.cli login --paste\n"
+                "  python -m garmin_ghin.cli login --chrome\n",
                 file=sys.stderr,
             )
             raise SystemExit(1)

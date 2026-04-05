@@ -1,23 +1,33 @@
-"""CLI for testing Garmin golf scorecard extraction."""
+"""CLI for Garmin golf scorecard extraction."""
 
 import argparse
 import logging
 import sys
 
-from .config import load_config
-
 
 def cmd_login(args) -> None:
-    """Open browser to log into Garmin and capture session tokens."""
-    from .browser_login import browser_login
-    from .garmin_client import TOKEN_DIR
+    """Import Garmin session cookies."""
+    from .auth import import_from_chrome, save_cookie_string
 
-    config = load_config()
-    browser_login(config.garmin.email, config.garmin.password, str(TOKEN_DIR))
+    if args.chrome:
+        import_from_chrome()
+    elif args.paste:
+        print("Paste your Cookie header value from browser dev tools,")
+        print("then press Enter:\n")
+        cookie_string = input("> ").strip()
+        if not cookie_string:
+            print("No cookies provided.")
+            sys.exit(1)
+        save_cookie_string(cookie_string)
+    else:
+        print("Specify a method:\n")
+        print("  python -m garmin_ghin.cli login --paste   (paste from dev tools)")
+        print("  python -m garmin_ghin.cli login --chrome  (auto-read from Chrome)")
 
 
 def cmd_scorecard(args) -> None:
     """Fetch and display the most recent golf scorecard."""
+    from .config import load_config
     from .garmin_client import GarminClient
 
     config = load_config()
@@ -53,7 +63,9 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command")
 
     # login subcommand
-    subparsers.add_parser("login", help="Log into Garmin via browser (required first time)")
+    login_parser = subparsers.add_parser("login", help="Import Garmin session cookies")
+    login_parser.add_argument("--paste", action="store_true", help="Paste cookie string from dev tools")
+    login_parser.add_argument("--chrome", action="store_true", help="Auto-read from Chrome browser")
 
     # scorecard subcommand
     sc_parser = subparsers.add_parser("scorecard", help="Fetch and display most recent scorecard")
