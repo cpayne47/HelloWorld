@@ -71,13 +71,20 @@ class Scorecard:
 
     def summary(self) -> str:
         """Human-readable summary for confirmation emails."""
+        vs_par = self.score_vs_par if self.score_vs_par is not None else (
+            self.computed_total - self.computed_par if self.holes else None
+        )
+        score_line = f"Score:  {self.computed_total}"
+        if vs_par is not None:
+            score_line += f" ({vs_par:+d} vs par {self.computed_par})"
+        else:
+            score_line += f" (par {self.computed_par})"
+
         lines = [
             f"Course: {self.course_name}",
             f"Date:   {self.date_played.isoformat()}",
             f"Holes:  {self.num_holes}",
-            f"Score:  {self.computed_total} ({self.score_vs_par:+d} vs par)"
-            if self.score_vs_par is not None
-            else f"Score:  {self.computed_total} (par {self.computed_par})",
+            score_line,
         ]
         if self.tee_name:
             lines.append(f"Tees:   {self.tee_name}")

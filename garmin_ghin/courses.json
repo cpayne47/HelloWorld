@@ -1,0 +1,24 @@
+{
+  "courses": [
+    {
+      "garmin_name": "Desert Mountain - No 7",
+      "ghin_name": "Desert Mountain No 7",
+      "num_holes": 9,
+      "tees": {
+        "Men's Tees": {
+          "label": "Par 3s",
+          "pars": [3, 3, 3, 3, 3, 3, 3, 3, 3],
+          "rating": null,
+          "slope": null
+        },
+        "Women's Tees": {
+          "label": "Par 4s",
+          "pars": [4, 4, 4, 4, 4, 4, 4, 4, 4],
+          "rating": null,
+          "slope": null
+        }
+      },
+      "default_tee": "Women's Tees"
+    }
+  ]
+}
