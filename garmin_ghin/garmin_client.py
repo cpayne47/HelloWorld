@@ -133,8 +133,12 @@ class GarminClient:
         else:
             logger.info("Already logged in at: %s", driver.current_url)
 
-    def get_recent_golf_rounds(self, days_back: int = 30) -> list[dict]:
-        """Navigate to scorecards page and extract scorecard list."""
+    def get_recent_golf_rounds(self, days_back: int = 30, scroll_all: bool = False) -> list[dict]:
+        """Navigate to scorecards page and extract scorecard list.
+
+        If scroll_all is True, scrolls to the bottom repeatedly to load all
+        historical scorecards (for bulk extraction).
+        """
         driver = self._ensure_browser()
         self._login(driver)
 
@@ -142,6 +146,27 @@ class GarminClient:
         if "/scorecards" not in driver.current_url:
             driver.get(GARMIN_SCORECARDS_URL)
             time.sleep(5)
+
+        # Scroll to load all scorecards if requested (Garmin uses lazy loading)
+        if scroll_all:
+            logger.info("Scrolling to load all scorecards...")
+            prev_count = 0
+            no_change_count = 0
+            for scroll_attempt in range(100):  # Max 100 scrolls
+                items = driver.find_elements("css selector", "[class*='GolfList_listItem']")
+                current_count = len(items)
+                if current_count == prev_count:
+                    no_change_count += 1
+                    if no_change_count >= 3:
+                        logger.info("No new items after %d scrolls, done loading (%d items)",
+                                    scroll_attempt + 1, current_count)
+                        break
+                else:
+                    no_change_count = 0
+                    logger.debug("Scroll %d: %d items loaded", scroll_attempt + 1, current_count)
+                prev_count = current_count
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(2)
 
         # Dump page source for debugging
         page_text = driver.find_element("tag name", "body").text
@@ -326,9 +351,10 @@ class GarminClient:
                 break
 
         scorecard = Scorecard(
-            garmin_activity_id=0,
+            garmin_activity_id=scorecard_id or "",
             course_name=course_name,
             date_played=date_played,
+            garmin_tee_name=tee_name,
             tee_name=tee_name,
         )
 
@@ -343,9 +369,9 @@ class GarminClient:
         labels = {"hole", "par", "score", "gir", "putts"}
         summary_labels = {"out", "in", "total"}
 
-        # Collect all values grouped by label, in order of appearance
-        # Each label can appear twice (front 9 + back 9)
-        all_rows = {}  # label -> list of values (combined front+back)
+        # Collect all values grouped by label, in order of appearance.
+        # GIR uses checkmarks/X rather than numbers.
+        all_rows = {}  # label -> list of values
         current_label = None
 
         for line in lines:
@@ -361,30 +387,39 @@ class GarminClient:
             if current_label is None:
                 continue
 
-            # Skip summary labels and their totals
+            # Skip summary labels
             if low in summary_labels:
-                # The next number after Out/In/Total is a summary — skip it
                 continue
 
-            # Skip GIR-style stats like "6/9"
+            # Skip fraction stats like "6/9" (GIR/fairway summaries)
             if re.match(r'^\d+/\d+$', stripped):
                 continue
 
-            # Skip non-data lines (new section labels, badge names, etc.)
-            if stripped == "—":
+            if current_label == "gir":
+                # GIR values: checkmark chars, "X", or dash
+                if stripped in ("\u2713", "\u2714", "\u2705", "Y", "y") or "✓" in stripped or "✔" in stripped:
+                    all_rows["gir"].append(True)
+                elif stripped in ("X", "x", "\u2717", "\u2718", "✗", "✘") or "✕" in stripped or "✖" in stripped:
+                    all_rows["gir"].append(False)
+                elif stripped == "—":
+                    all_rows["gir"].append(None)
+                elif not stripped:
+                    continue
+                else:
+                    # Could be a unicode checkmark we didn't catch
+                    logger.debug("Unknown GIR value: %r (ord: %s)", stripped,
+                                 [ord(c) for c in stripped])
+                    all_rows["gir"].append(None)
+            elif stripped == "—":
                 all_rows[current_label].append(None)
             elif stripped.isdigit():
                 val = int(stripped)
-                # Filter out summary totals: if this is hole row, only 1-18
                 if current_label == "hole":
                     if 1 <= val <= 18:
                         all_rows[current_label].append(val)
-                    # else it's a summary total, skip
                 else:
                     all_rows[current_label].append(val)
             else:
-                # Hit a non-numeric, non-label line — end of this label's data
-                # But only if we already have values (avoid stopping on blank lines)
                 if all_rows.get(current_label):
                     current_label = None
 
@@ -392,25 +427,15 @@ class GarminClient:
         par_vals = all_rows.get("par", [])
         score_vals = all_rows.get("score", [])
         putts_vals = all_rows.get("putts", [])
+        gir_vals = all_rows.get("gir", [])
 
-        # The par/score/putts rows include summary totals (Out, In, Total sums).
-        # Since we skipped summary labels, the totals that follow them should also
-        # be skipped. But our skip logic only skips the label, not the number.
-        # Fix: trim par/score/putts to match the number of holes.
-        # For front 9: 9 holes -> par has 9 values + 1 summary = 10. Back 9 similar.
-        # We align by using hole_nums as the reference length.
-
-        # Actually, let's be smarter: pair values positionally with hole numbers.
-        # Remove summary values from par/score/putts by keeping only as many
-        # values as we have hole numbers, removing every 10th value (the summary).
+        # Strip summary totals (every 10th value after each set of 9)
         def strip_summaries(vals, hole_count_per_nine=9):
-            """Remove the summary value that appears after every 9 holes."""
             result = []
             count = 0
             for v in vals:
                 count += 1
                 if count == hole_count_per_nine + 1:
-                    # This is the Out/In/Total summary — skip it
                     count = 0
                     continue
                 result.append(v)
@@ -423,27 +448,88 @@ class GarminClient:
         if len(putts_vals) > len(hole_nums):
             putts_vals = strip_summaries(putts_vals)
 
-        logger.debug("Parsed rows - holes: %s, par: %s, score: %s, putts: %s",
-                      hole_nums, par_vals, score_vals, putts_vals)
+        logger.debug("Parsed rows - holes: %s, par: %s, score: %s, putts: %s, gir: %s",
+                      hole_nums, par_vals, score_vals, putts_vals, gir_vals)
 
-        # Build hole scores from the extracted rows
+        # Build hole scores for played holes
         num_holes = min(len(hole_nums), len(par_vals), len(score_vals)) if hole_nums else 0
         for i in range(num_holes):
             hole_num = hole_nums[i]
             if not isinstance(hole_num, int) or hole_num < 1 or hole_num > 18:
                 continue
             par = par_vals[i] if par_vals[i] is not None else 4
-            score = score_vals[i] if score_vals[i] is not None else 0
-            if score == 0:
+            score = score_vals[i] if score_vals[i] is not None else None
+            if score is None:
                 continue  # Skip unplayed holes
             putts = putts_vals[i] if i < len(putts_vals) and putts_vals[i] is not None else None
+            gir = gir_vals[i] if i < len(gir_vals) else None
 
             scorecard.holes.append(HoleScore(
                 hole_number=hole_num,
                 par=par,
                 score=score,
                 putts=putts,
+                gir=gir,
             ))
+
+        # Extract summary stats from the Stats section of page text
+        stats_section = False
+        for line in non_empty:
+            if line == "Stats":
+                stats_section = True
+                continue
+            if stats_section:
+                if line == "Badges":
+                    break
+                if "Eagle or better" in line:
+                    try:
+                        idx = non_empty.index(line)
+                        if idx > 0 and non_empty[idx - 1].isdigit():
+                            scorecard.eagles_or_better = int(non_empty[idx - 1])
+                    except (ValueError, IndexError):
+                        pass
+                elif line == "Birdie":
+                    try:
+                        idx = non_empty.index(line)
+                        if idx > 0 and non_empty[idx - 1].isdigit():
+                            scorecard.birdies = int(non_empty[idx - 1])
+                    except (ValueError, IndexError):
+                        pass
+                elif line == "Par":
+                    try:
+                        idx = non_empty.index(line)
+                        if idx > 0 and non_empty[idx - 1].isdigit():
+                            scorecard.pars = int(non_empty[idx - 1])
+                    except (ValueError, IndexError):
+                        pass
+                elif line == "Bogey":
+                    try:
+                        idx = non_empty.index(line)
+                        if idx > 0 and non_empty[idx - 1].isdigit():
+                            scorecard.bogeys = int(non_empty[idx - 1])
+                    except (ValueError, IndexError):
+                        pass
+                elif "Double Bogey or worse" in line:
+                    try:
+                        idx = non_empty.index(line)
+                        if idx > 0 and non_empty[idx - 1].isdigit():
+                            scorecard.double_bogeys_or_worse = int(non_empty[idx - 1])
+                    except (ValueError, IndexError):
+                        pass
+                elif "Fairways Hit" in line:
+                    try:
+                        idx = non_empty.index(line)
+                        if idx > 0 and re.match(r'^\d+/\d+$', non_empty[idx - 1]):
+                            scorecard.fairways_hit = non_empty[idx - 1]
+                    except (ValueError, IndexError):
+                        pass
+                elif line == "GIR":
+                    try:
+                        idx = non_empty.index(line)
+                        if idx > 0 and re.match(r'^\d+/\d+$', non_empty[idx - 1]):
+                            scorecard.gir_summary = non_empty[idx - 1]
+                    except (ValueError, IndexError):
+                        pass
 
         if not scorecard.holes:
             # Save for debugging
@@ -453,15 +539,16 @@ class GarminClient:
             print(f"\nPage text:\n{page_text[:2000]}")
 
         # Apply correct pars from course database (Garmin's pars can be wrong)
-        garmin_tee = scorecard.tee_name or ""
+        garmin_tee = scorecard.garmin_tee_name or ""
         correct_pars = get_correct_pars(scorecard.course_name)
         if correct_pars:
             logger.info("Applying corrected pars from course database for '%s'",
                         scorecard.course_name)
-            for i, hole in enumerate(scorecard.holes):
-                if i < len(correct_pars):
+            for hole in scorecard.holes:
+                idx = hole.hole_number - 1
+                if idx < len(correct_pars):
                     old_par = hole.par
-                    hole.par = correct_pars[i]
+                    hole.par = correct_pars[idx % len(correct_pars)]
                     if old_par != hole.par:
                         logger.debug("Hole %d: par %d -> %d", hole.hole_number, old_par, hole.par)
 
@@ -471,6 +558,9 @@ class GarminClient:
                 scorecard.tee_name = tee_box
                 logger.info("Mapped '%s' -> %s", garmin_tee, tee_box)
 
+            # Expand to 18 holes with correct pars for unplayed holes
+            scorecard.ensure_18_holes(correct_pars)
+
             # Update to GHIN course name if available
             ghin_name = get_ghin_name(scorecard.course_name)
             if ghin_name:
@@ -478,6 +568,10 @@ class GarminClient:
         else:
             logger.info("No course database entry for '%s' — using Garmin pars",
                         scorecard.course_name)
+            scorecard.ensure_18_holes()
+
+        # Compute scoring stats from hole data
+        scorecard.compute_stats()
 
         return scorecard
 

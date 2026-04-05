@@ -3,12 +3,14 @@
 import argparse
 import logging
 import sys
+import time
 
 
 def cmd_scorecard(args) -> None:
     """Fetch and display the most recent golf scorecard."""
     from .config import load_config
     from .garmin_client import GarminClient
+    from .scorecard_db import save_scorecard
 
     config = load_config()
     client = GarminClient(config.garmin)
@@ -23,15 +25,11 @@ def cmd_scorecard(args) -> None:
 
         print(f"Found {len(activities)} golf round(s).\n")
 
-        # Show what we found
         for i, act in enumerate(activities[:5]):
-            sc_id = act.get("scorecardId", act.get("activityId", "?"))
             text = act.get("text", act.get("activityName", ""))
             stats = act.get("stats", [])
             stats_str = f"  [{', '.join(stats)}]" if stats else ""
             print(f"  [{i+1}] {text[:60]}{stats_str}")
-            if act.get("href"):
-                print(f"       -> {act['href']}")
 
         # Fetch the most recent
         latest = activities[0]
@@ -43,9 +41,13 @@ def cmd_scorecard(args) -> None:
             scorecard = client.get_scorecard(sc_id or "", href=href)
             print(scorecard.summary())
 
+            # Save to database
+            db_id = save_scorecard(scorecard)
+            print(f"\nSaved to database (id={db_id})")
+
             issues = scorecard.validate()
             if not issues:
-                print("\nScorecard looks good!")
+                print("Scorecard looks good!")
             else:
                 print("\nValidation issues:")
                 for issue in issues:
@@ -56,6 +58,114 @@ def cmd_scorecard(args) -> None:
 
     finally:
         client.close()
+
+
+def cmd_bulk(args) -> None:
+    """Extract all available scorecards from Garmin and save to database."""
+    from .config import load_config
+    from .garmin_client import GarminClient
+    from .scorecard_db import save_scorecard, scorecard_exists
+
+    config = load_config()
+    client = GarminClient(config.garmin)
+
+    try:
+        print("Launching Chrome and connecting to Garmin Connect...")
+        print("Fetching all available scorecards (scrolling to load history)...\n")
+
+        activities = client.get_recent_golf_rounds(days_back=args.days, scroll_all=True)
+
+        if not activities:
+            print("No golf rounds found.")
+            sys.exit(0)
+
+        print(f"Found {len(activities)} scorecard(s) on the list page.\n")
+
+        saved = 0
+        skipped = 0
+        errors = 0
+
+        for i, act in enumerate(activities):
+            sc_id = act.get("scorecardId", "")
+            href = act.get("href", "")
+            text = act.get("text", "")
+
+            # Check if already in database
+            if sc_id and scorecard_exists(sc_id):
+                print(f"  [{i+1}/{len(activities)}] {text[:50]} — already saved, skipping")
+                skipped += 1
+                continue
+
+            print(f"  [{i+1}/{len(activities)}] {text[:50]} — fetching...")
+
+            try:
+                scorecard = client.get_scorecard(sc_id, href=href)
+
+                if scorecard.played_holes:
+                    db_id = save_scorecard(scorecard)
+                    vs_par = scorecard.computed_total - scorecard.computed_par
+                    print(f"    -> {scorecard.course_name} | {scorecard.date_played} | "
+                          f"Score: {scorecard.computed_total} ({vs_par:+d}) | "
+                          f"Putts: {scorecard.total_putts or '-'} | "
+                          f"Saved (id={db_id})")
+                    saved += 1
+                else:
+                    print(f"    -> No hole data found, skipping")
+                    errors += 1
+
+                # Brief pause between fetches to be polite
+                if i < len(activities) - 1:
+                    time.sleep(2)
+
+            except Exception as e:
+                print(f"    -> Error: {e}")
+                errors += 1
+                logging.getLogger(__name__).debug("Error fetching scorecard", exc_info=True)
+
+        print(f"\nDone! Saved: {saved}, Skipped (already saved): {skipped}, Errors: {errors}")
+
+    finally:
+        client.close()
+
+
+def cmd_history(args) -> None:
+    """Show scorecards stored in the local database."""
+    from .scorecard_db import list_scorecards, load_scorecard
+
+    scorecards = list_scorecards(limit=args.limit)
+
+    if not scorecards:
+        print("No scorecards in database yet.")
+        print("Run 'python -m garmin_ghin.cli scorecard' or 'bulk' to fetch some.")
+        return
+
+    if args.id:
+        # Show detailed view of a specific scorecard
+        sc = load_scorecard(args.id)
+        if not sc:
+            print(f"No scorecard found with id={args.id}")
+            return
+        print(sc.summary())
+        return
+
+    print(f"{'ID':>4}  {'Date':<12} {'Course':<30} {'Tee':<5} {'Nine':<6} "
+          f"{'Score':>5} {'vs Par':>6} {'Putts':>5} {'GIR':<5}")
+    print("-" * 95)
+
+    for sc in scorecards:
+        nine = sc.get("nine_played", "")
+        nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
+        vs_par = sc.get("score_vs_par")
+        vs_par_str = f"{vs_par:+d}" if vs_par is not None else "-"
+        putts = sc.get("total_putts")
+        putts_str = str(putts) if putts is not None else "-"
+        gir = sc.get("gir_summary") or "-"
+
+        print(f"{sc['id']:>4}  {sc['date_played']:<12} {sc['course_name']:<30} "
+              f"{(sc.get('tee_name') or '-'):<5} {nine_label:<6} "
+              f"{sc.get('total_score') or '-':>5} {vs_par_str:>6} {putts_str:>5} {gir:<5}")
+
+    print(f"\n{len(scorecards)} scorecard(s). Use 'history --id N' to see details.")
 
 
 def main() -> None:
@@ -73,6 +183,24 @@ def main() -> None:
         help="Look back this many days for rounds (default: 30)",
     )
 
+    # bulk subcommand
+    bulk_parser = subparsers.add_parser("bulk", help="Extract all available scorecards from Garmin")
+    bulk_parser.add_argument(
+        "-n", "--days", type=int, default=3650,
+        help="Look back this many days (default: 3650 = ~10 years)",
+    )
+
+    # history subcommand
+    hist_parser = subparsers.add_parser("history", help="Show scorecards from local database")
+    hist_parser.add_argument(
+        "--id", type=int, default=None,
+        help="Show detailed view of a specific scorecard by ID",
+    )
+    hist_parser.add_argument(
+        "--limit", type=int, default=50,
+        help="Max scorecards to show (default: 50)",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -82,6 +210,10 @@ def main() -> None:
 
     if args.command == "scorecard":
         cmd_scorecard(args)
+    elif args.command == "bulk":
+        cmd_bulk(args)
+    elif args.command == "history":
+        cmd_history(args)
     else:
         parser.print_help()
 
