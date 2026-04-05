@@ -36,6 +36,47 @@ def cmd_login(args) -> None:
         print("  python -m garmin_ghin.cli login --paste             (paste interactively)")
 
 
+def cmd_debug(args) -> None:
+    """Probe Garmin API endpoints to diagnose auth/data issues."""
+    import json
+    from .auth import load_cookies
+    import requests
+
+    cookies = load_cookies()
+    session = requests.Session()
+    for name, value in cookies.items():
+        session.cookies.set(name, value, domain=".garmin.com")
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                      "AppleWebKit/537.36 (KHTML, like Gecko) "
+                      "Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "NK": "NT",
+        "Di-Backend": "connectapi.garmin.com",
+    })
+
+    base = "https://connect.garmin.com"
+    endpoints = [
+        "/proxy/userprofile-service/usersocial/profile",
+        "/proxy/userprofile-service/socialProfile",
+        "/modern/proxy/userprofile-service/usersocial/profile",
+        "/proxy/activitylist-service/activities/search/activities?limit=5",
+        "/modern/proxy/activitylist-service/activities/search/activities?limit=5",
+        "/proxy/activity-service/activity/search?limit=5",
+        "/proxy/gcs-golfcommunity/api/v2/scorecard/list?limit=5",
+        "/proxy/gcs-golfcommunity/api/v2/scorecard?limit=5",
+    ]
+
+    for ep in endpoints:
+        url = base + ep
+        resp = session.get(url)
+        body = resp.text[:500] if resp.text else "(empty)"
+        print(f"\n{'='*60}")
+        print(f"GET {ep}")
+        print(f"Status: {resp.status_code}  |  Size: {len(resp.text)} bytes")
+        print(f"Body: {body}")
+
+
 def cmd_scorecard(args) -> None:
     """Fetch and display the most recent golf scorecard."""
     from .config import load_config
@@ -79,6 +120,9 @@ def main() -> None:
     login_parser.add_argument("--paste", action="store_true", help="Paste cookie string interactively")
     login_parser.add_argument("--chrome", action="store_true", help="Auto-read from Chrome browser")
 
+    # debug subcommand
+    subparsers.add_parser("debug", help="Probe Garmin API endpoints for diagnostics")
+
     # scorecard subcommand
     sc_parser = subparsers.add_parser("scorecard", help="Fetch and display most recent scorecard")
     sc_parser.add_argument(
@@ -95,6 +139,8 @@ def main() -> None:
 
     if args.command == "login":
         cmd_login(args)
+    elif args.command == "debug":
+        cmd_debug(args)
     elif args.command == "scorecard":
         cmd_scorecard(args)
     else:
