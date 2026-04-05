@@ -1,13 +1,16 @@
-"""Garmin Connect client for retrieving golf round data."""
+"""Garmin Connect client for retrieving golf round data.
 
+Uses browser-based auth (Playwright) to bypass Cloudflare TLS fingerprinting,
+then makes API calls using requests with the captured session cookies.
+"""
+
+import json
 import logging
 import sys
-import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from garminconnect import Garmin
-from garminconnect.exceptions import GarminConnectTooManyRequestsError
+import requests
 
 from .config import GarminConfig
 from .scorecard import HoleScore, Scorecard
@@ -15,110 +18,114 @@ from .scorecard import HoleScore, Scorecard
 logger = logging.getLogger(__name__)
 
 TOKEN_DIR = Path(__file__).resolve().parent.parent / "token_store"
+AUTH_FILE = TOKEN_DIR / "browser_auth.json"
+
+GARMIN_API = "https://connect.garmin.com"
 
 
 class GarminClient:
-    """Wraps garminconnect library to fetch golf activities."""
+    """Fetches golf data from Garmin Connect using browser-captured session."""
 
     GOLF_ACTIVITY_TYPE = "golf"
 
     def __init__(self, config: GarminConfig):
         self._config = config
-        self._client: Garmin | None = None
+        self._session: requests.Session | None = None
 
-    def _ensure_connected(self) -> Garmin:
-        if self._client is not None:
-            return self._client
+    def _ensure_connected(self) -> requests.Session:
+        if self._session is not None:
+            return self._session
 
-        TOKEN_DIR.mkdir(exist_ok=True)
-        tokenstore = str(TOKEN_DIR)
+        if not AUTH_FILE.exists():
+            print(
+                "No saved Garmin session found.\n"
+                "Run browser login first:\n\n"
+                "  python -m garmin_ghin.browser_login\n",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
-        # First try: load cached tokens (no credentials needed)
-        try:
-            client = Garmin()
-            client.login(tokenstore)
-            logger.info("Garmin: logged in with cached tokens")
-            self._client = client
-            return client
-        except Exception as e:
-            logger.info("Garmin: cached token login failed (%s), trying fresh login", e)
+        auth_data = json.loads(AUTH_FILE.read_text())
+        session = requests.Session()
 
-        # Second try: full login with credentials (with retry on rate limit)
-        backoff_delays = [30, 60, 120, 300]  # seconds: 30s, 1m, 2m, 5m
-        last_error = None
+        # Load cookies from browser capture
+        for cookie in auth_data.get("cookies", []):
+            session.cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain", ""),
+                path=cookie.get("path", "/"),
+            )
 
-        for attempt in range(len(backoff_delays) + 1):
-            try:
-                client = Garmin(self._config.email, self._config.password)
-                client.login()
-                client.garth.dump(tokenstore)
-                logger.info("Garmin: fresh login succeeded, tokens cached to %s", tokenstore)
-                break
-            except GarminConnectTooManyRequestsError as e:
-                last_error = e
-                if attempt < len(backoff_delays):
-                    wait = backoff_delays[attempt]
-                    print(
-                        f"Rate limited by Garmin (attempt {attempt + 1}). "
-                        f"Waiting {wait}s before retry...",
-                        file=sys.stderr,
-                    )
-                    time.sleep(wait)
-                else:
-                    logger.error("Garmin login failed after %d retries: %s", attempt, e)
-                    print(
-                        "\n--- Garmin Login Failed (Rate Limited) ---\n"
-                        "Garmin is blocking login attempts. Wait 15-20 minutes\n"
-                        "and try again. Do NOT retry rapidly — it makes it worse.\n",
-                        file=sys.stderr,
-                    )
-                    raise
-            except Exception as e:
-                last_error = e
-                logger.error("Garmin login failed: %s", e)
-                print(
-                    "\n--- Garmin Login Failed ---\n"
-                    f"Error: {e}\n\n"
-                    "Troubleshooting:\n"
-                    "  1. Verify your GARMIN_EMAIL and GARMIN_PASSWORD in .env\n"
-                    "  2. Try logging into connect.garmin.com in a browser first\n"
-                    "  3. If you have MFA/2FA enabled, that may cause issues\n"
-                    "     (try disabling it temporarily for first login)\n"
-                    "  4. Garmin may be rate-limiting logins — wait a few minutes\n"
-                    "  5. Check https://github.com/cyberjunky/python-garminconnect/issues\n"
-                    "     for known auth issues\n"
-                    "  6. Try: pip install --upgrade garminconnect garth\n",
-                    file=sys.stderr,
-                )
-                raise
+        # Set headers to look like a browser
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/131.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+            "NK": "NT",
+            "Di-Backend": "connectapi.garmin.com",
+        })
 
-        self._client = client
-        return client
+        # Verify session is valid
+        resp = session.get(f"{GARMIN_API}/userprofile-service/usersocial/profile")
+        if resp.status_code == 401 or resp.status_code == 403:
+            print(
+                "Saved session has expired. Re-run browser login:\n\n"
+                "  python -m garmin_ghin.browser_login\n",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        resp.raise_for_status()
 
-    def get_recent_golf_rounds(self, days_back: int = 7) -> list[dict]:
+        profile = resp.json()
+        display_name = profile.get("displayName", "Unknown")
+        logger.info("Garmin: authenticated as %s", display_name)
+
+        self._session = session
+        return session
+
+    def get_recent_golf_rounds(self, days_back: int = 30) -> list[dict]:
         """Fetch golf activities from the last N days."""
-        client = self._ensure_connected()
+        session = self._ensure_connected()
         start = (date.today() - timedelta(days=days_back)).isoformat()
         end = date.today().isoformat()
 
-        activities = client.get_activities_by_date(start, end, self.GOLF_ACTIVITY_TYPE)
+        resp = session.get(
+            f"{GARMIN_API}/activitylist-service/activities/search/activities",
+            params={
+                "activityType": self.GOLF_ACTIVITY_TYPE,
+                "startDate": start,
+                "endDate": end,
+                "limit": 50,
+            },
+        )
+        resp.raise_for_status()
+        activities = resp.json()
+
         logger.info("Garmin: found %d golf activities in last %d days", len(activities), days_back)
         return activities
 
     def get_scorecard(self, activity_id: int) -> Scorecard:
         """Fetch full scorecard details for a golf activity."""
-        client = self._ensure_connected()
+        session = self._ensure_connected()
 
-        # Get the activity summary
-        activity = client.get_activity(activity_id)
+        # Get activity summary
+        resp = session.get(f"{GARMIN_API}/activity-service/activity/{activity_id}")
+        resp.raise_for_status()
+        activity = resp.json()
 
-        # Get detailed per-hole data
-        details = client.get_activity_details(activity_id)
+        # Get scorecard data
+        resp = session.get(
+            f"{GARMIN_API}/gcs-golfcommunity/api/v2/scorecard/activity/{activity_id}/details"
+        )
+        resp.raise_for_status()
+        scorecard_data = resp.json()
 
-        return self._build_scorecard(activity_id, activity, details)
+        return self._build_scorecard(activity_id, activity, scorecard_data)
 
-    def _build_scorecard(self, activity_id: int, activity: dict, details: dict) -> Scorecard:
-        """Reconstruct a Scorecard from Garmin activity JSON."""
+    def _build_scorecard(self, activity_id: int, activity: dict, scorecard_data: dict) -> Scorecard:
+        """Reconstruct a Scorecard from Garmin API responses."""
         # Parse date
         start_time = activity.get("startTimeLocal") or activity.get("startTimeGMT", "")
         try:
@@ -126,43 +133,49 @@ class GarminClient:
         except (ValueError, AttributeError):
             date_played = date.today()
 
-        course_name = activity.get("locationName") or activity.get("activityName", "Unknown Course")
+        course_name = (
+            activity.get("locationName")
+            or activity.get("activityName", "Unknown Course")
+        )
 
+        # Build scorecard from summary
+        summary = activity.get("summaryDTO", {})
         scorecard = Scorecard(
             garmin_activity_id=activity_id,
             course_name=course_name,
             date_played=date_played,
-            total_score=activity.get("scorecardSummaryDTO", {}).get("totalScore"),
-            total_putts=activity.get("scorecardSummaryDTO", {}).get("totalPutts"),
-            score_vs_par=activity.get("scorecardSummaryDTO", {}).get("scoreToPar"),
+            total_score=summary.get("totalScore") or summary.get("scoringTotalScore"),
+            total_putts=summary.get("totalPutts"),
+            score_vs_par=summary.get("scoreToPar"),
         )
 
-        # Extract hole-by-hole data from scorecard DTO
-        scorecard_holes = activity.get("scorecardSummaryDTO", {}).get("scorecardHoles", [])
-        if not scorecard_holes:
-            # Try alternate path in detailed data
-            scorecard_holes = details.get("scorecardHoles", [])
+        # Extract hole-by-hole from scorecard detail endpoint
+        holes_data = scorecard_data.get("holes", [])
+        if not holes_data:
+            # Fallback: try the activity's embedded scorecard
+            holes_data = (
+                activity.get("scorecardSummaryDTO", {}).get("scorecardHoles", [])
+            )
 
-        for hole_data in scorecard_holes:
+        for hole_data in holes_data:
             hole = HoleScore(
-                hole_number=hole_data.get("holeNumber", 0),
+                hole_number=hole_data.get("holeNumber", hole_data.get("number", 0)),
                 par=hole_data.get("par", 4),
-                score=hole_data.get("strokes", 0),
+                score=hole_data.get("strokes", hole_data.get("score", 0)),
                 putts=hole_data.get("putts"),
                 fairway_hit=hole_data.get("fairwayHit"),
-                gir=hole_data.get("greenInRegulation"),
+                gir=hole_data.get("greenInRegulation", hole_data.get("gir")),
                 penalties=hole_data.get("penalties", 0),
             )
             scorecard.holes.append(hole)
 
-        # Sort holes by number
         scorecard.holes.sort(key=lambda h: h.hole_number)
 
         logger.info(
-            "Built scorecard: %s on %s, %d holes, score %d",
+            "Built scorecard: %s on %s, %d holes, score %s",
             course_name,
             date_played,
             scorecard.num_holes,
-            scorecard.computed_total,
+            scorecard.computed_total if scorecard.holes else "N/A",
         )
         return scorecard
