@@ -424,32 +424,40 @@ class GarminClient:
 
         # === Extract front 9 and back 9 from each label ===
         def extract_front_back(items):
-            """Split a label's items at summary markers into front/back groups.
+            """Extract front 9 and back 9 values from a label's items.
 
-            Layout: [front values] Out [Out total] [back values] In [In total] Total [grand total]
-            Summary markers split data into groups:
-              group[0] = front 9 values
-              group[1] = [Out total] + back 9 values  (or just back values if no total)
-              group[2+] = In/Grand totals (ignored)
+            Two layouts exist in Garmin's page text:
+              1. With summaries (Hole row): values separated by Out/In/Total markers
+                 → split at summary markers into groups
+              2. Without summaries (Par/Score rows): just raw numbers
+                 → positional: front=[0:9], Out total=[9], back=[10:19]
             """
-            groups = [[]]
-            for ttype, tval in items:
-                if ttype == "summary":
-                    groups.append([])
-                elif ttype in ("num", "dash"):
-                    groups[-1].append(tval)
-                # skip frac and symbol tokens
+            has_summaries = any(t == "summary" for t, v in items)
 
-            front = groups[0][:9]
+            if has_summaries:
+                # Split at summary markers into groups of data values
+                groups = [[]]
+                for ttype, tval in items:
+                    if ttype == "summary":
+                        groups.append([])
+                    elif ttype in ("num", "dash"):
+                        groups[-1].append(tval)
 
-            back = []
-            if len(groups) > 1:
-                g = groups[1]
-                if len(g) > 9:
-                    # First value is the Out total — skip it
-                    back = g[1:10]
-                else:
-                    back = g[:9]
+                front = groups[0][:9]
+                back = []
+                if len(groups) > 1:
+                    g = groups[1]
+                    if len(g) > 9:
+                        back = g[1:10]  # skip Out total
+                    else:
+                        back = g[:9]
+            else:
+                # No summaries — use positional indexing
+                # Layout: 9 front values, Out total, 9 back values, In total, Grand total
+                values = [tval for ttype, tval in items if ttype in ("num", "dash")]
+                front = values[:9]
+                # Skip Out total at index 9, back 9 starts at index 10
+                back = values[10:19] if len(values) > 10 else []
 
             return front, back
 
@@ -483,7 +491,7 @@ class GarminClient:
                 score=score,
             ))
 
-        # Apply correct pars from course database (Garmin's pars can be wrong)
+        # Apply course database corrections
         garmin_tee = scorecard.garmin_tee_name or ""
         correct_pars = get_correct_pars(scorecard.course_name)
         if correct_pars:
@@ -493,14 +501,17 @@ class GarminClient:
                 # Use modulo so 9-hole course pars wrap to cover holes 10-18
                 hole.par = correct_pars[(hole.hole_number - 1) % len(correct_pars)]
 
-            tee_box = get_tee_box(scorecard.course_name, garmin_tee)
-            if tee_box:
-                scorecard.tee_name = tee_box
+        # Apply tee box mapping and GHIN name (independent of par corrections)
+        tee_box = get_tee_box(scorecard.course_name, garmin_tee)
+        if tee_box:
+            scorecard.tee_name = tee_box
 
-            ghin_name = get_ghin_name(scorecard.course_name)
-            if ghin_name:
-                scorecard.course_name = ghin_name
-        else:
+        ghin_name = get_ghin_name(scorecard.course_name)
+        if ghin_name:
+            logger.info("Renaming '%s' -> '%s'", scorecard.course_name, ghin_name)
+            scorecard.course_name = ghin_name
+
+        if not correct_pars and not ghin_name:
             logger.info("No course database entry for '%s' — using Garmin pars",
                         scorecard.course_name)
 

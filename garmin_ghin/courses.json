@@ -1,6 +1,15 @@
 {
   "courses": [
     {
+      "garmin_name": "Desert Mountain",
+      "ghin_name": "Desert Mountain Apache",
+      "num_holes": 18,
+      "par": null,
+      "pars": null,
+      "tees": {},
+      "default_tee": null
+    },
+    {
       "garmin_name": "Desert Mountain - No 7",
       "ghin_name": "Desert Mountain No 7",
       "num_holes": 9,
