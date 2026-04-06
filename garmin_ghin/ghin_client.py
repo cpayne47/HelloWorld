@@ -400,11 +400,16 @@ class GHINClient:
         name_lower = course_name.lower()
         return any(home in name_lower for home in HOME_COURSES)
 
-    def _best_tee_match(self, tee_options: list[str], garmin_tee: str | None) -> str | None:
+    def _best_tee_match(self, tee_options: list[str], garmin_tee: str | None,
+                        nine_played: str | None = None) -> str | None:
         """Pick the best tee from GHIN dropdown options based on Garmin tee name.
 
         Garmin tee names are like "White Tees", "Blue Tees", "Copper/White Tees".
-        GHIN options look like "Copper/White  69.5 / 123 / 72" or "Blue  71.2 / 130 / 72".
+        GHIN options look like "Copper/White  69.5 / 123 / 72" or for 9-hole rounds:
+        "Copper/White (Front)  34.9 / 124 / 36" and "Copper/White (Back)  34.9 / 124 / 36".
+
+        nine_played: "front", "back", or "both"/None — used to pick the right
+        9-hole tee variant when options include (Front)/(Back).
         """
         if not tee_options:
             return None
@@ -418,11 +423,25 @@ class GHINClient:
                             if w.lower() not in ("tees", "tee", "men's", "women's")]
 
             # Score each GHIN option by how many color words match
+            # Bonus point for matching the correct nine (Front/Back)
             best_score = -1
             best_option = None
             for opt in tee_options:
                 opt_lower = opt.lower()
                 score = sum(1 for color in garmin_colors if color in opt_lower)
+
+                # Boost/penalize based on front/back match
+                if nine_played == "back":
+                    if "(back)" in opt_lower:
+                        score += 10  # Strong preference
+                    elif "(front)" in opt_lower:
+                        score -= 10  # Wrong nine
+                elif nine_played == "front":
+                    if "(front)" in opt_lower:
+                        score += 10
+                    elif "(back)" in opt_lower:
+                        score -= 10
+
                 if score > best_score:
                     best_score = score
                     best_option = opt
@@ -604,7 +623,7 @@ class GHINClient:
 
                 # Pick best match
                 garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
-                best = self._best_tee_match(tee_options, garmin_tee)
+                best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
 
                 if best:
                     # Click the matching option
@@ -635,7 +654,7 @@ class GHINClient:
                         logger.info("Custom dropdown tee options: %s", tee_options)
 
                         garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
-                        best = self._best_tee_match(tee_options, garmin_tee)
+                        best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
                         if best:
                             for oel in option_els:
                                 if oel.text.strip() == best:
