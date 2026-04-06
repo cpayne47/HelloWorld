@@ -108,16 +108,39 @@ def cmd_bulk(args) -> None:
                     break
 
                 if scorecard.played_holes:
-                    db_id = save_scorecard(scorecard)
                     nine = scorecard.nine_played
                     nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
                     vs_par = scorecard.computed_total - scorecard.computed_par
+
+                    if args.step:
+                        # Interactive debug mode: show full scorecard
+                        print()
+                        print("=" * 60)
+                        print(scorecard.summary())
+                        print("=" * 60)
+                        resp = input("\nType 'proceed' to save & continue, 'skip' to skip, 'quit' to stop: ").strip().lower()
+                        if resp == "quit":
+                            print("Stopping.")
+                            break
+                        elif resp == "skip":
+                            print("    -> Skipped (not saved)")
+                            continue
+
+                    db_id = save_scorecard(scorecard)
                     print(f"    -> {scorecard.course_name} | {scorecard.date_played} | "
                           f"{nine_label} | Score: {scorecard.computed_total} ({vs_par:+d}) | "
                           f"Saved (id={db_id})")
                     saved += 1
                 else:
-                    print(f"    -> 18 holes parsed but all dashes — no scores recorded, skipping")
+                    print(f"    -> 18 holes parsed but all dashes — no scores recorded")
+                    if args.step:
+                        print()
+                        print("=" * 60)
+                        print(scorecard.summary())
+                        print("=" * 60)
+                        resp = input("\nType 'proceed' to continue, 'quit' to stop: ").strip().lower()
+                        if resp == "quit":
+                            break
                     errors += 1
 
                 # Brief pause between fetches to be polite
@@ -218,6 +241,10 @@ def main() -> None:
     bulk_parser.add_argument(
         "--force", action="store_true",
         help="Re-extract and overwrite all scorecards, even ones already saved",
+    )
+    bulk_parser.add_argument(
+        "--step", action="store_true",
+        help="Interactive debug mode: show full scorecard and wait for 'proceed' before continuing",
     )
 
     # history subcommand
