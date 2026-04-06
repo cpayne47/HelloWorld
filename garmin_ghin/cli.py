@@ -277,6 +277,25 @@ def cmd_sync(args) -> None:
         client.close()
 
 
+def cmd_ghin_login(args) -> None:
+    """Test GHIN login — just log in and report status."""
+    from .config import load_config
+    from .ghin_client import GHINClient
+
+    config = load_config()
+    if not config.ghin:
+        print("GHIN credentials not configured. Add GHIN_NUMBER and GHIN_PASSWORD to .env")
+        sys.exit(1)
+
+    client = GHINClient(config.ghin)
+    try:
+        client.login()
+        print("\nGHIN login test complete. Page text (first 300 chars):")
+        print(client.get_page_text()[:300])
+    finally:
+        client.close()
+
+
 def cmd_fix_names() -> None:
     """Apply course name mappings from courses.json to existing DB records."""
     from .course_db import _load_db
@@ -369,6 +388,9 @@ def main() -> None:
     # sync subcommand
     subparsers.add_parser("sync", help="Check Garmin for new rounds and add to database")
 
+    # ghin-login subcommand
+    subparsers.add_parser("ghin-login", help="Test GHIN login")
+
     # fix-names subcommand
     subparsers.add_parser("fix-names",
                           help="Apply course name mappings from courses.json to existing DB records")
@@ -399,6 +421,8 @@ def main() -> None:
         cmd_tees(args)
     elif args.command == "sync":
         cmd_sync(args)
+    elif args.command == "ghin-login":
+        cmd_ghin_login(args)
     else:
         parser.print_help()
 

@@ -24,6 +24,12 @@ class GarminConfig:
 
 
 @dataclass(frozen=True)
+class GHINConfig:
+    ghin_number: str
+    password: str
+
+
+@dataclass(frozen=True)
 class SMTPConfig:
     host: str
     port: int
@@ -35,6 +41,7 @@ class SMTPConfig:
 @dataclass(frozen=True)
 class AppConfig:
     garmin: GarminConfig
+    ghin: GHINConfig | None = None
     smtp: SMTPConfig | None = None
     poll_interval_minutes: int = 30
 
@@ -51,11 +58,19 @@ def load_config() -> AppConfig:
             notify_email=_require("NOTIFY_EMAIL"),
         )
 
+    ghin = None
+    if os.getenv("GHIN_NUMBER"):
+        ghin = GHINConfig(
+            ghin_number=os.getenv("GHIN_NUMBER"),
+            password=os.getenv("GHIN_PASSWORD", ""),
+        )
+
     return AppConfig(
         garmin=GarminConfig(
             email=_require("GARMIN_EMAIL"),
             password=_require("GARMIN_PASSWORD"),
         ),
+        ghin=ghin,
         smtp=smtp,
         poll_interval_minutes=int(os.getenv("POLL_INTERVAL_MINUTES", "30")),
     )
