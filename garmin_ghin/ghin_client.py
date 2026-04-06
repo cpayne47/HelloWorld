@@ -647,7 +647,8 @@ class GHINClient:
         time.sleep(4)
 
         # ── Step 5: Select tees ──
-        logger.info("Reading tee options from dropdown (nine_played=%s)...", nine)
+        logger.info("Reading tee options from dropdown (nine_played=%s, garmin_tee=%s)...",
+                     nine, scorecard.garmin_tee_name or scorecard.tee_name)
         tee_options = []
         selected_tee = None
         garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
@@ -655,19 +656,25 @@ class GHINClient:
         try:
             # Strategy 1: Look for a native <select> element
             selects = driver.find_elements("css selector", "select")
+            logger.info("Found %d <select> elements on page", len(selects))
             tee_select = None
-            for sel in selects:
+            for idx, sel in enumerate(selects):
                 options = sel.find_elements("tag name", "option")
                 option_texts = [opt.text.strip() for opt in options if opt.text.strip()]
-                logger.debug("Found <select> with options: %s", option_texts[:10])
-                # Tee selects typically have rating/slope numbers
-                if any(any(c.isdigit() for c in ot) for ot in option_texts):
+                logger.info("  <select> #%d options: %s", idx, option_texts[:10])
+                # Tee selects typically have rating/slope numbers or tee-like words
+                has_digits = any(any(c.isdigit() for c in ot) for ot in option_texts)
+                has_tee_words = any(
+                    any(w in ot.lower() for w in ("tee", "front", "back", "men", "women", "gold", "blue", "white", "red", "copper"))
+                    for ot in option_texts
+                )
+                if has_digits or has_tee_words:
                     tee_select = sel
+                    logger.info("  -> Matched as tee selector (digits=%s, tee_words=%s)", has_digits, has_tee_words)
                     break
 
             if tee_select:
                 logger.info("Found native <select> for tees")
-                # Scroll it into view
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block: 'center'});", tee_select)
                 time.sleep(0.5)
@@ -681,7 +688,6 @@ class GHINClient:
 
                 best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
                 if best:
-                    # Use Select helper for native selects
                     from selenium.webdriver.support.ui import Select
                     select_helper = Select(tee_select)
                     select_helper.select_by_visible_text(best)
@@ -691,25 +697,69 @@ class GHINClient:
                     time.sleep(1)
             else:
                 logger.info("No native <select> found, trying custom dropdown...")
-                # Strategy 2: Find any element on the page showing tee-like text
-                # (has numbers that look like rating/slope, e.g. "69.5 / 123 / 72")
-                all_els = driver.find_elements("css selector", "*")
+                # Strategy 2: Look for elements with tee/rating text using targeted selectors
+                # rather than iterating all elements
                 tee_el = None
-                for el in all_els:
-                    try:
-                        el_text = el.text.strip()
-                        if not el_text or len(el_text) > 80:
-                            continue
-                        # Match pattern like "Copper/White 69.5 / 123 / 72"
-                        if re.search(r'\d+\.?\d*\s*/\s*\d+\s*/\s*\d+', el_text):
-                            tag = el.tag_name
-                            if tag in ('select', 'option', 'script', 'style'):
+
+                # Try XPath: find elements containing rating/slope pattern text
+                try:
+                    xpath_candidates = driver.find_elements("xpath",
+                        "//*[contains(text(), '/') and string-length(text()) < 80]")
+                    logger.info("XPath candidates with '/': %d", len(xpath_candidates))
+                    for el in xpath_candidates:
+                        try:
+                            el_text = el.text.strip()
+                            if not el_text or len(el_text) > 80:
                                 continue
-                            tee_el = el
-                            logger.info("Found tee display element: tag=%s text='%s'", tag, el_text)
-                            break
-                    except Exception:
-                        continue
+                            if re.search(r'\d+\.?\d*\s*/\s*\d+', el_text):
+                                tag = el.tag_name
+                                if tag in ('select', 'option', 'script', 'style', 'head'):
+                                    continue
+                                tee_el = el
+                                logger.info("Found tee display element: tag=%s text='%s'", tag, el_text)
+                                break
+                        except Exception:
+                            continue
+                except Exception as xe:
+                    logger.debug("XPath tee search failed: %s", xe)
+
+                # Strategy 3: Look for clickable dropdown triggers near tee labels
+                if not tee_el:
+                    logger.info("Trying to find tee dropdown by label...")
+                    try:
+                        # Look for "Tee" or "Tees" label and nearby clickable elements
+                        labels = driver.find_elements("xpath",
+                            "//*[contains(translate(text(), 'TEE', 'tee'), 'tee') and "
+                            "string-length(text()) < 30]")
+                        logger.info("Found %d tee-label elements", len(labels))
+                        for lbl in labels[:5]:
+                            try:
+                                logger.info("  Tee label: tag=%s text='%s'", lbl.tag_name, lbl.text.strip())
+                                # Try clicking the label's parent or sibling dropdown
+                                parent = lbl.find_element("xpath", "..")
+                                # Look for a clickable element in the parent container
+                                clickables = parent.find_elements("css selector",
+                                    "select, div[class*='select'], div[class*='dropdown'], "
+                                    "div[role='listbox'], div[role='combobox'], "
+                                    "[class*='react-select'], [class*='MuiSelect']")
+                                if clickables:
+                                    tee_el = clickables[0]
+                                    logger.info("Found dropdown near tee label: tag=%s", tee_el.tag_name)
+                                    break
+                                # Also check grandparent
+                                grandparent = parent.find_element("xpath", "..")
+                                clickables = grandparent.find_elements("css selector",
+                                    "select, div[class*='select'], div[class*='dropdown'], "
+                                    "div[role='listbox'], div[role='combobox'], "
+                                    "[class*='react-select'], [class*='MuiSelect']")
+                                if clickables:
+                                    tee_el = clickables[0]
+                                    logger.info("Found dropdown near tee grandparent: tag=%s", tee_el.tag_name)
+                                    break
+                            except Exception:
+                                continue
+                    except Exception as le:
+                        logger.debug("Label-based tee search failed: %s", le)
 
                 if tee_el:
                     # Click to open the dropdown
@@ -740,10 +790,16 @@ class GHINClient:
                                     break
                 else:
                     logger.warning("Could not find any tee selector element on page")
+                    # Dump page text for debugging
+                    try:
+                        page_text = driver.find_element("tag name", "body").text
+                        logger.info("Page text for tee debugging (600 chars): %s", page_text[:600])
+                    except Exception:
+                        pass
 
         except Exception as e:
             report["issues"].append(f"Error selecting tees: {e}")
-            logger.error("Error selecting tees: %s", e)
+            logger.error("Error selecting tees: %s", e, exc_info=True)
 
         report["selections"]["tee_options_available"] = tee_options
         report["selections"]["tee_selected"] = selected_tee or "UNKNOWN"
@@ -806,12 +862,15 @@ class GHINClient:
                 if not el_text:
                     continue
                 if "enter" in el_text and "hole" in el_text:
+                    # Save text before click (element goes stale after page navigates)
+                    saved_text = el_text
+                    saved_tag = el.tag_name
                     # Scroll into view and click
                     driver.execute_script(
                         "arguments[0].scrollIntoView({block: 'center'}); "
                         "arguments[0].click();", el)
                     hbh_entered = True
-                    logger.info("Clicked HBH button: '%s' (tag=%s)", el.text.strip(), el.tag_name)
+                    logger.info("Clicked HBH button: '%s' (tag=%s)", saved_text, saved_tag)
                     break
 
             if not hbh_entered:
