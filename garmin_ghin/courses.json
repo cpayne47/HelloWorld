@@ -3,6 +3,7 @@
     {
       "garmin_name": "Desert Mountain",
       "ghin_name": "Desert Mountain Apache",
+      "ghin_list_text": "Apache",
       "num_holes": 18,
       "par": null,
       "pars": null,
@@ -12,6 +13,7 @@
     {
       "garmin_name": "Desert Mountain - No 7",
       "ghin_name": "Desert Mountain No 7",
+      "ghin_list_text": "Seven",
       "num_holes": 9,
       "par": 3,
       "pars": [3, 3, 3, 3, 3, 3, 3, 3, 3],
@@ -32,6 +34,7 @@
     {
       "garmin_name": "Pebble Beach Golf Links - Peter Hay Par Three",
       "ghin_name": "The Hay",
+      "ghin_list_text": "The Hay",
       "num_holes": 9,
       "par": 3,
       "pars": [3, 3, 3, 3, 3, 3, 3, 3, 3],

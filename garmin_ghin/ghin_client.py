@@ -321,6 +321,19 @@ class GHINClient:
         return ""
 
     @staticmethod
+    def _get_ghin_list_text(course_name: str) -> str | None:
+        """Look up the GHIN course list display text from courses.json."""
+        try:
+            from .course_db import _load_db
+            db = _load_db()
+            for course in db.get("courses", []):
+                if course.get("ghin_name", "") == course_name:
+                    return course.get("ghin_list_text")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def _is_home_course(course_name: str) -> bool:
         """Check if a course should be scored as Home."""
         name_lower = course_name.lower()
@@ -415,84 +428,62 @@ class GHINClient:
 
         time.sleep(3)
 
-        # ── Step 3: Select course ──
-        logger.info("Selecting course: %s", scorecard.course_name)
+        # ── Step 3: Select course from the on-page list ──
+        course_name = scorecard.course_name
+        logger.info("Selecting course: %s", course_name)
         course_selected = False
 
-        # First try: look for the course in the recently played / my courses list
-        try:
-            # Look for course rows — they typically contain the course name text
-            body_text = driver.find_element("tag name", "body").text
-            logger.debug("Post score page text (500): %s", body_text[:500])
+        # Load ghin_list_text mapping from courses.json
+        ghin_list_text = self._get_ghin_list_text(course_name)
+        # Build list of search terms to try, most specific first
+        search_terms = []
+        if ghin_list_text:
+            search_terms.append(ghin_list_text.lower())
+        search_terms.append(course_name.lower())
+        # Also try the last word (e.g. "Apache" from "Desert Mountain Apache")
+        parts = course_name.split()
+        if len(parts) > 1:
+            search_terms.append(parts[-1].lower())
+        logger.info("Course search terms: %s", search_terms)
 
-            # Try clicking on course name text directly
-            course_name = scorecard.course_name
-            # GHIN uses "Desert Mountain" + "Apache" as separate elements
-            # Try to find a clickable element containing the GHIN course name
+        try:
+            # Read all course row elements from the list
             all_clickable = driver.find_elements("css selector",
                 "a, button, tr, div[class*='course'], div[class*='row'], li")
 
-            # Build search terms from the course name
-            # e.g. "Desert Mountain Apache" -> try "Apache", "Desert Mountain"
-            name_parts = course_name.split()
-            # Try exact match first, then partial
+            # Log what courses are visible on the page
+            course_entries = []
             for el in all_clickable:
                 el_text = el.text.strip()
-                if not el_text:
-                    continue
-                el_lower = el_text.lower()
-                # Check if this element's text matches our course
-                if course_name.lower() in el_lower:
-                    driver.execute_script("arguments[0].click();", el)
-                    course_selected = True
-                    logger.info("Selected course by full name: '%s'", el_text[:60])
-                    break
+                if el_text and 5 < len(el_text) < 120:
+                    course_entries.append(el_text)
+            logger.info("Course list entries found: %s", course_entries[:15])
 
-            # If no exact match, try matching the distinguishing part (e.g. "Apache")
-            if not course_selected:
-                # For "Desert Mountain Apache", the GHIN list shows "Desert Mountain" on left, "Apache" on right
-                # Try to find just the sub-name (last word or words after common prefix)
-                ghin_parts = course_name.split()
-                # Try the last word first (e.g. "Apache", "Seven", "Outlaw")
-                for search_term in [ghin_parts[-1]] if len(ghin_parts) > 1 else [course_name]:
-                    for el in all_clickable:
-                        el_text = el.text.strip()
-                        if search_term.lower() in el_text.lower() and len(el_text) < 100:
-                            driver.execute_script("arguments[0].click();", el)
-                            course_selected = True
-                            logger.info("Selected course by partial match '%s': '%s'",
-                                        search_term, el_text[:60])
-                            break
-                    if course_selected:
+            # Try each search term against list entries
+            for term in search_terms:
+                for el in all_clickable:
+                    el_text = el.text.strip()
+                    if not el_text or len(el_text) > 120:
+                        continue
+                    if term in el_text.lower():
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'}); "
+                            "arguments[0].click();", el)
+                        course_selected = True
+                        logger.info("Selected course: '%s' (matched term '%s')",
+                                    el_text[:60], term)
                         break
-
-            # If still not found, try the search box
-            if not course_selected:
-                search_inputs = driver.find_elements("css selector",
-                    "input[placeholder*='COURSE'], input[placeholder*='course'], input[type='search']")
-                if search_inputs:
-                    search_input = search_inputs[0]
-                    search_input.clear()
-                    search_input.send_keys(course_name)
-                    logger.info("Typed course name in search box")
-                    time.sleep(3)
-                    # Click first result
-                    results = driver.find_elements("css selector",
-                        "div[class*='result'], div[class*='option'], li, tr")
-                    for el in results:
-                        el_text = el.text.strip()
-                        if el_text and any(p.lower() in el_text.lower() for p in name_parts[-2:]):
-                            driver.execute_script("arguments[0].click();", el)
-                            course_selected = True
-                            logger.info("Selected course from search results: '%s'", el_text[:60])
-                            break
+                if course_selected:
+                    break
 
         except Exception as e:
             logger.error("Error selecting course: %s", e)
             report["issues"].append(f"Error selecting course: {e}")
 
         if not course_selected:
-            report["issues"].append(f"Could not find course '{course_name}' in GHIN list")
+            report["issues"].append(
+                f"Could not find course '{course_name}' in GHIN list. "
+                f"Search terms tried: {search_terms}")
             return report
 
         report["selections"]["course"] = course_name
