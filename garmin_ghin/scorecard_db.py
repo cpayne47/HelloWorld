@@ -199,6 +199,23 @@ def scorecard_exists(garmin_activity_id: str) -> bool:
         conn.close()
 
 
+def round_exists(date_played: str, course_name: str, total_score: int) -> bool:
+    """Check if a round with this date + course + score is already stored.
+
+    Handles multiple rounds on the same day at the same course by matching
+    the score as well.
+    """
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM scorecards WHERE date_played = ? AND course_name = ? AND total_score = ?",
+            (date_played, course_name, total_score),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def _row_to_scorecard(conn: sqlite3.Connection, row: sqlite3.Row) -> Scorecard:
     """Convert a database row + hole rows into a Scorecard object."""
     holes_rows = conn.execute(

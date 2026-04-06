@@ -198,10 +198,15 @@ def cmd_history(args) -> None:
 
 
 def cmd_sync(args) -> None:
-    """Check Garmin for new rounds and add any to the database."""
+    """Check Garmin for new rounds and add any to the database.
+
+    Walks down the scorecard list from newest to oldest. For each round,
+    fetches the full scorecard, then checks the database by date + course + score.
+    Stops as soon as it finds a round that's already recorded.
+    """
     from .config import load_config
     from .garmin_client import GarminClient
-    from .scorecard_db import save_scorecard, scorecard_exists
+    from .scorecard_db import round_exists, save_scorecard
 
     config = load_config()
     client = GarminClient(config.garmin)
@@ -214,26 +219,15 @@ def cmd_sync(args) -> None:
             print("No rounds found on Garmin.")
             return
 
-        # Find new rounds (not yet in database)
-        new_rounds = []
-        for act in activities:
-            sc_id = act.get("scorecardId", "")
-            if sc_id and not scorecard_exists(sc_id):
-                new_rounds.append(act)
-
-        if not new_rounds:
-            print(f"No new rounds. ({len(activities)} on Garmin, all already in database.)")
-            return
-
-        print(f"Found {len(new_rounds)} new round(s).\n")
+        print(f"Found {len(activities)} round(s) on Garmin. Checking for new ones...\n")
 
         saved = 0
-        for i, act in enumerate(new_rounds):
+        for i, act in enumerate(activities):
             sc_id = act.get("scorecardId", "")
             href = act.get("href", "")
             text = act.get("text", "")
 
-            print(f"  [{i+1}/{len(new_rounds)}] {text[:50]} — fetching...")
+            print(f"  [{i+1}] {text[:50]} — fetching...")
 
             try:
                 scorecard = client.get_scorecard(sc_id, href=href)
@@ -243,19 +237,31 @@ def cmd_sync(args) -> None:
                     print(f"    -> Debug: check debug_scorecard_text.txt")
                     continue
 
-                if scorecard.played_holes:
-                    db_id = save_scorecard(scorecard)
-                    nine = scorecard.nine_played
-                    nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
-                    vs_par = scorecard.computed_total - scorecard.computed_par
-                    print(f"    -> {scorecard.course_name} | {scorecard.date_played} | "
-                          f"{nine_label} | Score: {scorecard.computed_total} ({vs_par:+d}) | "
-                          f"Tees: {scorecard.garmin_tee_name or '-'} | Saved (id={db_id})")
-                    saved += 1
-                else:
+                if not scorecard.played_holes:
                     print(f"    -> No scores recorded, skipping")
+                    continue
 
-                if i < len(new_rounds) - 1:
+                # Check if this round is already in the database
+                if round_exists(
+                    scorecard.date_played.isoformat(),
+                    scorecard.course_name,
+                    scorecard.computed_total,
+                ):
+                    print(f"    -> {scorecard.course_name} | {scorecard.date_played} | "
+                          f"Score: {scorecard.computed_total} — already in database. Done.")
+                    break
+
+                # New round — save it
+                db_id = save_scorecard(scorecard)
+                nine = scorecard.nine_played
+                nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
+                vs_par = scorecard.computed_total - scorecard.computed_par
+                print(f"    -> NEW: {scorecard.course_name} | {scorecard.date_played} | "
+                      f"{nine_label} | Score: {scorecard.computed_total} ({vs_par:+d}) | "
+                      f"Tees: {scorecard.garmin_tee_name or '-'} | Saved (id={db_id})")
+                saved += 1
+
+                if i < len(activities) - 1:
                     time.sleep(2)
 
             except Exception as e:
@@ -265,7 +271,7 @@ def cmd_sync(args) -> None:
         if saved:
             print(f"\nAdded {saved} new round(s) to database.")
         else:
-            print("\nNo new rounds to add.")
+            print("\nNo new rounds.")
 
     finally:
         client.close()
