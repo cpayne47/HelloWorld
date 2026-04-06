@@ -80,8 +80,21 @@ class GHINClient:
         try:
             page_text = driver.find_element("tag name", "body").text.lower()
             url = driver.current_url.lower()
+
+            # If we're on the login page, we're definitely not logged in
+            if "/login" in url:
+                logger.debug("On /login URL — not logged in")
+                return False
+
+            # If login form elements are visible, we're not logged in
+            login_page_markers = ["email address or ghin number", "log in\n"]
+            for marker in login_page_markers:
+                if marker in page_text:
+                    logger.debug("Login page marker found: '%s' — not logged in", marker)
+                    return False
+
             # Check for authenticated indicators
-            indicators = ["post score", "post a score", "my stats", "handicap index",
+            indicators = ["post score", "post a score", "my stats",
                           "recent scores", "score history", "round history"]
             for indicator in indicators:
                 if indicator in page_text:
