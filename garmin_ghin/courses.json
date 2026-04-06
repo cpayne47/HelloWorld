@@ -40,6 +40,16 @@
       "pars": [3, 3, 3, 3, 3, 3, 3, 3, 3],
       "tees": {},
       "default_tee": null
+    },
+    {
+      "garmin_name": "Lake Wildwood Golf Course",
+      "ghin_name": "Lake Wildwood",
+      "ghin_list_text": "Lake Wildwood CC",
+      "num_holes": 18,
+      "par": null,
+      "pars": null,
+      "tees": {},
+      "default_tee": null
     }
   ]
 }

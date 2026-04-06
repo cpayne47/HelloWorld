@@ -320,6 +320,62 @@ class GHINClient:
             return self._driver.find_element("tag name", "body").text
         return ""
 
+    def _click_course_in_list(self, driver, search_terms: list[str]) -> bool:
+        """Try to click a course from the visible list using XPath text search.
+
+        Tries each search term, clicks the matching element, and walks up to
+        parent/grandparent if the click doesn't navigate away from Select Course.
+        Returns True if course was successfully selected.
+        """
+        for term in search_terms:
+            try:
+                xpath = f"//*[contains(text(), '{term}')]"
+                matches = driver.find_elements("xpath", xpath)
+                logger.info("XPath search for '%s': found %d matches", term, len(matches))
+
+                for el in matches:
+                    el_text = el.text.strip()
+                    tag = el.tag_name
+                    logger.debug("  Match: tag=%s text='%s'", tag, el_text[:80])
+
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'});", el)
+                    time.sleep(0.5)
+
+                    # Try clicking the element, then parent, then grandparent
+                    for ancestor_label, target in self._element_and_ancestors(el):
+                        try:
+                            driver.execute_script("arguments[0].click();", target)
+                            time.sleep(2)
+                            new_text = driver.find_element("tag name", "body").text
+                            if "select course" not in new_text.lower():
+                                logger.info("Selected course via %s of '%s' (tag=%s)",
+                                            ancestor_label, term, tag)
+                                return True
+                            logger.debug("%s click didn't navigate", ancestor_label)
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                logger.debug("XPath search for '%s' failed: %s", term, e)
+
+        return False
+
+    @staticmethod
+    def _element_and_ancestors(el):
+        """Yield (label, element) for the element and its parent/grandparent."""
+        yield ("element", el)
+        try:
+            parent = el.find_element("xpath", "./..")
+            yield ("parent", parent)
+        except Exception:
+            pass
+        try:
+            grandparent = el.find_element("xpath", "./../..")
+            yield ("grandparent", grandparent)
+        except Exception:
+            pass
+
     @staticmethod
     def _get_ghin_list_text(course_name: str) -> str | None:
         """Look up the GHIN course list display text from courses.json."""
@@ -446,85 +502,44 @@ class GHINClient:
         search_terms.append(course_name)
         logger.info("Course search terms: %s", search_terms)
 
-        try:
-            # Log full page text so we can see the course list
-            page_text = driver.find_element("tag name", "body").text
-            logger.info("Course selection page text (1000): %s", page_text[:1000])
+        # Try finding on the current tab (Recently Played), then My Courses
+        for tab_name in ["Recently Played", "My Courses"]:
+            if course_selected:
+                break
 
-            # Use XPath to find elements by text content — works regardless of
-            # element type (div, span, a, etc.) and handles React SPAs well.
-            for term in search_terms:
-                try:
-                    # Find elements whose text contains our search term
-                    xpath = f"//*[contains(text(), '{term}')]"
-                    matches = driver.find_elements("xpath", xpath)
-                    logger.info("XPath search for '%s': found %d matches", term, len(matches))
+            try:
+                page_text = driver.find_element("tag name", "body").text
+                logger.info("[%s] Page text (800): %s", tab_name, page_text[:800])
 
-                    for el in matches:
-                        el_text = el.text.strip()
-                        tag = el.tag_name
-                        logger.debug("  Match: tag=%s text='%s'", tag, el_text[:80])
+                course_selected = self._click_course_in_list(driver, search_terms)
 
-                        # Click via JS — try the element, then walk up to find
-                        # the clickable row/container if needed
-                        driver.execute_script(
-                            "arguments[0].scrollIntoView({block: 'center'});", el)
-                        time.sleep(0.5)
-
-                        # Click the element itself
-                        driver.execute_script("arguments[0].click();", el)
-                        time.sleep(2)
-
-                        # Verify we left the course selection page
-                        new_text = driver.find_element("tag name", "body").text
-                        if "select course" not in new_text.lower():
-                            course_selected = True
-                            logger.info("Selected course via '%s': tag=%s text='%s'",
-                                        term, tag, el_text[:60])
+                if not course_selected and tab_name == "Recently Played":
+                    # Course not on Recently Played — switch to My Courses tab
+                    logger.info("Course not found on Recently Played, trying My Courses tab...")
+                    tab_clicked = False
+                    all_els = driver.find_elements("css selector",
+                        "button, a, div[role='tab'], span, div[class*='tab']")
+                    for el in all_els:
+                        if el.text.strip() == "My Courses":
+                            driver.execute_script("arguments[0].click();", el)
+                            tab_clicked = True
+                            logger.info("Clicked 'My Courses' tab")
                             break
+                    if tab_clicked:
+                        time.sleep(3)
+                    else:
+                        logger.info("My Courses tab not found")
+                        break
 
-                        # Click didn't navigate — try the parent element
-                        logger.debug("Click on <%s> didn't navigate, trying parent...", tag)
-                        try:
-                            parent = el.find_element("xpath", "./..")
-                            driver.execute_script("arguments[0].click();", parent)
-                            time.sleep(2)
-                            new_text = driver.find_element("tag name", "body").text
-                            if "select course" not in new_text.lower():
-                                course_selected = True
-                                logger.info("Selected course via parent of '%s'", el_text[:60])
-                                break
-                        except Exception:
-                            pass
-
-                        # Try grandparent
-                        logger.debug("Parent click didn't navigate, trying grandparent...")
-                        try:
-                            grandparent = el.find_element("xpath", "./../..")
-                            driver.execute_script("arguments[0].click();", grandparent)
-                            time.sleep(2)
-                            new_text = driver.find_element("tag name", "body").text
-                            if "select course" not in new_text.lower():
-                                course_selected = True
-                                logger.info("Selected course via grandparent of '%s'", el_text[:60])
-                                break
-                        except Exception:
-                            pass
-
-                except Exception as e:
-                    logger.debug("XPath search for '%s' failed: %s", term, e)
-
-                if course_selected:
-                    break
-
-        except Exception as e:
-            logger.error("Error selecting course: %s", e)
-            report["issues"].append(f"Error selecting course: {e}")
+            except Exception as e:
+                logger.error("Error selecting course on %s: %s", tab_name, e)
+                report["issues"].append(f"Error selecting course: {e}")
 
         if not course_selected:
             report["issues"].append(
-                f"Could not find course '{course_name}' in GHIN list. "
-                f"Search terms tried: {search_terms}")
+                f"Could not find course '{course_name}' in GHIN list "
+                f"(tried Recently Played and My Courses). "
+                f"Search terms: {search_terms}")
             return report
 
         report["selections"]["course"] = course_name
