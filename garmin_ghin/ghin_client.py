@@ -362,6 +362,57 @@ class GHINClient:
         return False
 
     @staticmethod
+    def _find_score_inputs(driver) -> list:
+        """Find the writable score input fields on the GHIN scorecard grid.
+
+        Returns a fresh list of input elements (avoids stale references).
+        """
+        score_inputs = driver.find_elements("css selector",
+            "input[type='number'], input[type='tel'], "
+            "td input, input[class*='score'], input[aria-label*='score'], "
+            "input[aria-label*='Score'], input[name*='score']")
+
+        if not score_inputs:
+            score_inputs = driver.find_elements("css selector", "table input")
+
+        if not score_inputs:
+            all_inputs = driver.find_elements("css selector", "input")
+            score_inputs = [inp for inp in all_inputs
+                            if inp.get_attribute("type") in ("text", "number", "tel", "")
+                            and inp.is_displayed()
+                            and inp.get_attribute("readonly") is None]
+
+        # Filter out read-only / disabled / summary fields
+        writable = []
+        for inp in score_inputs:
+            try:
+                if inp.get_attribute("readonly") or inp.get_attribute("disabled"):
+                    continue
+                writable.append(inp)
+            except Exception:
+                continue
+
+        return writable
+
+    @staticmethod
+    def _fill_input(inp, value):
+        """Clear and fill a single input field, handling React SPA quirks."""
+        try:
+            inp.clear()
+            inp.send_keys(str(value))
+        except Exception:
+            # Fallback: set via JS if send_keys fails
+            from selenium.webdriver.remote.webelement import WebElement
+            inp.parent.execute_script("""
+                var el = arguments[0];
+                var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value').set;
+                nativeInputValueSetter.call(el, arguments[1]);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            """, inp, str(value))
+
+    @staticmethod
     def _element_and_ancestors(el):
         """Yield (label, element) for the element and its parent/grandparent."""
         yield ("element", el)
@@ -790,88 +841,40 @@ class GHINClient:
 
         # ── Step 9: Fill in hole-by-hole scores ──
         logger.info("Filling in hole-by-hole scores...")
-        played_holes = scorecard.played_holes
         scores_entered = {}
 
         try:
-            # The GHIN scorecard grid has SCORE rows for Front 9 and Back 9
-            # Each has input fields for holes 1-9 and 10-18
-            # Find all score input fields in the grid
+            # Re-find inputs fresh to avoid stale element references
+            # (the page may have re-rendered since earlier steps)
+            score_inputs = self._find_score_inputs(driver)
+            logger.info("Found %d score input fields", len(score_inputs))
 
-            # Try finding inputs in the SCORE row by looking at table structure
-            score_inputs = driver.find_elements("css selector",
-                "input[type='number'], input[type='tel'], "
-                "td input, input[class*='score'], input[aria-label*='score'], "
-                "input[aria-label*='Score'], input[name*='score']")
-
-            if not score_inputs:
-                # Broader search
-                score_inputs = driver.find_elements("css selector", "table input, .scorecard input")
-
-            if not score_inputs:
-                # Even broader — find all text/number inputs on the page
-                all_inputs = driver.find_elements("css selector", "input")
-                score_inputs = [inp for inp in all_inputs
-                                if inp.get_attribute("type") in ("text", "number", "tel", "")
-                                and inp.is_displayed()
-                                and inp.get_attribute("readonly") is None]
-
-            logger.info("Found %d potential score input fields", len(score_inputs))
-
-            # We expect 18 inputs for 18 holes (or 9 for 9 holes)
-            # Filter to just the ones that appear to be in the score entry area
-            # The GHIN form typically has Front 9 inputs then Back 9 inputs
-            if len(score_inputs) >= 18:
-                # Assume first 18 are the hole score inputs (may include summary fields)
-                # Check: GHIN has SCORE row with 9 inputs + OUT summary, then 9 inputs + IN + TOTAL
-                # The summary cells are usually read-only
-                writable_inputs = []
-                for inp in score_inputs:
-                    readonly = inp.get_attribute("readonly")
-                    disabled = inp.get_attribute("disabled")
-                    tabindex = inp.get_attribute("tabindex")
-                    if readonly or disabled:
-                        continue
-                    # Check if it looks like a score cell (not a summary cell)
-                    writable_inputs.append(inp)
-
-                logger.info("Found %d writable score inputs", len(writable_inputs))
-                score_inputs = writable_inputs
-
-            # Map holes to inputs
-            # For 18-hole rounds: inputs 0-8 = holes 1-9, inputs 9-17 = holes 10-18
-            # For 9-hole front: inputs 0-8 = holes 1-9
-            # For 9-hole back: inputs 0-8 = holes 10-18 (on the Back 9 section)
             nine = scorecard.nine_played
 
+            # For 9-hole courses (like No 7), GHIN always shows holes 1-9
+            # in the grid regardless of whether front or back was played.
+            # The scores go into inputs 0-8 either way.
             if nine == "both" and len(score_inputs) >= 18:
-                # Fill all 18
+                # Full 18 holes
                 for i, h in enumerate(scorecard.holes):
                     if h.played and i < len(score_inputs):
-                        inp = score_inputs[i]
-                        inp.clear()
-                        inp.send_keys(str(h.score))
+                        self._fill_input(score_inputs[i], h.score)
                         scores_entered[h.hole_number] = h.score
                         time.sleep(0.15)
-            elif nine == "front" and len(score_inputs) >= 9:
-                for i in range(9):
-                    h = scorecard.holes[i]
-                    if h.played and i < len(score_inputs):
-                        inp = score_inputs[i]
-                        inp.clear()
-                        inp.send_keys(str(h.score))
-                        scores_entered[h.hole_number] = h.score
-                        time.sleep(0.15)
-            elif nine == "back" and len(score_inputs) >= 9:
-                # For back 9: if 18 inputs exist, use indices 9-17
-                # If only 9 inputs (9-hole mode), use indices 0-8
-                offset = 9 if len(score_inputs) >= 18 else 0
-                for i in range(9):
-                    h = scorecard.holes[9 + i]  # holes 10-18
-                    if h.played and (offset + i) < len(score_inputs):
-                        inp = score_inputs[offset + i]
-                        inp.clear()
-                        inp.send_keys(str(h.score))
+            elif nine in ("front", "back") and len(score_inputs) >= 9:
+                # 9-hole round: if GHIN shows 18 inputs (18-hole course, back 9),
+                # use offset 9. If GHIN shows only 9 inputs (9-hole course like No 7),
+                # always use offset 0 — the grid only has holes 1-9.
+                played = scorecard.played_holes
+                if len(score_inputs) >= 18 and nine == "back":
+                    offset = 9
+                else:
+                    offset = 0
+
+                for i, h in enumerate(played):
+                    idx = offset + i
+                    if idx < len(score_inputs):
+                        self._fill_input(score_inputs[idx], h.score)
                         scores_entered[h.hole_number] = h.score
                         time.sleep(0.15)
             else:
