@@ -363,22 +363,14 @@ class GarminClient:
         # === Tokenize the scorecard table area ===
         #
         # Simplified parser: only extract Hole, Par, and Score.
-        # Ignore GIR, Putts, Fairway — those rows vary between rounds
-        # and make the parser brittle.
-        #
-        # The front 9 has labels (Hole, Par, Score, ...).
-        # The back 9 repeats the same data WITHOUT labels.
-        #
-        # Strategy:
-        #   1. Find the labeled "Hole", "Par", "Score" sections (front 9)
-        #   2. Find back 9 start at first token with value 10 after labels
-        #   3. Back 9: holes 10-18, then 9 par values, then 9 score values
+        # Garmin renders each row with BOTH front and back 9 inline:
+        #   Hole: 1 2 ... 9 Out 10 11 ... 18 In Total
+        #   Par:  4 4 ... 5  36  4  5 ...  4  36   72
+        #   Score: ...
+        # Summary words (Out/In/Total) appear between data groups.
+        # We split each label's data at summary markers to get front/back.
 
-        LABELS_WE_CARE_ABOUT = {"hole", "par", "score"}
-        # Labels we recognize but skip (consume their data so it doesn't
-        # bleed into subsequent sections)
-        LABELS_TO_SKIP = {"fairway", "gir", "putts"}
-        ALL_LABELS = LABELS_WE_CARE_ABOUT | LABELS_TO_SKIP
+        ALL_LABELS = {"hole", "par", "score", "fairway", "gir", "putts"}
         SUMMARY_WORDS = {"out", "in", "total"}
 
         # Tokenize everything between "Hole" and "Stats"
@@ -402,173 +394,80 @@ class GarminClient:
             if low in stop_words:
                 break
 
-            # Labels
             if low in ALL_LABELS:
                 tokens.append(("label", low))
-                continue
-
-            # Summary words
-            if low in SUMMARY_WORDS:
+            elif low in SUMMARY_WORDS:
                 tokens.append(("summary", low))
-                continue
-
-            # Fraction like "6/9"
-            if re.match(r'^\d+/\d+$', stripped):
+            elif re.match(r'^\d+/\d+$', stripped):
                 tokens.append(("frac", stripped))
-                continue
-
-            # Dash = unplayed hole
-            if stripped == "—":
+            elif stripped == "—":
                 tokens.append(("dash", None))
-                continue
-
-            # Number
-            if stripped.isdigit():
+            elif stripped.isdigit():
                 tokens.append(("num", int(stripped)))
-                continue
-
-            # Checkmarks, X marks, arrows — these belong to GIR/fairway rows
-            tokens.append(("symbol", stripped))
+            else:
+                tokens.append(("symbol", stripped))
 
         logger.debug("Tokens (%d): %s", len(tokens),
-                      [(t, v) for t, v in tokens[:80]])
+                      [(t, v) for t, v in tokens[:100]])
 
-        # === Split into labeled front-9 sections ===
-        # Each label gets at most 9 data values (front 9 only).
-        # Once a label has 9 values, additional data is NOT consumed —
-        # that's the back 9 (unlabeled).
-        front = {}  # label -> list of values
+        # === Collect all items per label ===
+        sections = {}  # label -> list of (ttype, tval)
         current_label = None
-        label_full = False  # True when current label has 9 values
-        last_consumed_idx = 0  # last token index we actually consumed
-
-        for i, (ttype, tval) in enumerate(tokens):
+        for ttype, tval in tokens:
             if ttype == "label":
                 current_label = tval
-                label_full = False
-                if current_label not in front:
-                    front[current_label] = []
-                last_consumed_idx = i
+                if current_label not in sections:
+                    sections[current_label] = []
                 continue
-            if current_label is None:
-                continue
-            if label_full:
-                # This label already has 9 values — don't consume more
-                continue
-            if ttype in ("summary", "frac"):
-                last_consumed_idx = i
-                continue
-            # Data value (num, dash, symbol)
-            front[current_label].append(tval)
-            last_consumed_idx = i
-            if len(front[current_label]) >= 9:
-                label_full = True
+            if current_label is not None:
+                sections[current_label].append((ttype, tval))
 
-        logger.debug("Front 9 sections:")
-        for label, vals in front.items():
-            logger.debug("  %s (%d): %s", label, len(vals), vals)
-        logger.debug("Last consumed token idx: %d of %d", last_consumed_idx, len(tokens))
+        # === Extract front 9 and back 9 from each label ===
+        def extract_front_back(items):
+            """Split a label's items at summary markers into front/back groups.
 
-        # === Parse back 9 from remaining tokens ===
-        # Find the sequence 10, 11, 12... which marks the back 9 hole numbers.
-        # We look for num==10 followed by num==11 to avoid false matches
-        # (e.g. a summary total of 10).
-        back9_start = None
-        for i in range(last_consumed_idx + 1, len(tokens) - 1):
-            ttype, tval = tokens[i]
-            if ttype == "num" and tval == 10:
-                # Verify next numeric token is 11
-                for j in range(i + 1, min(i + 3, len(tokens))):
-                    jtype, jval = tokens[j]
-                    if jtype == "num" and jval == 11:
-                        back9_start = i
-                        break
-                    elif jtype == "num":
-                        break  # next number isn't 11 — false match
-                if back9_start is not None:
-                    break
+            Layout: [front values] Out [Out total] [back values] In [In total] Total [grand total]
+            Summary markers split data into groups:
+              group[0] = front 9 values
+              group[1] = [Out total] + back 9 values  (or just back values if no total)
+              group[2+] = In/Grand totals (ignored)
+            """
+            groups = [[]]
+            for ttype, tval in items:
+                if ttype == "summary":
+                    groups.append([])
+                elif ttype in ("num", "dash"):
+                    groups[-1].append(tval)
+                # skip frac and symbol tokens
 
-        back_par = []
-        back_score = []
+            front = groups[0][:9]
 
-        if back9_start is not None:
-            # Collect all data tokens from back9_start
-            back_data = []
-            for i in range(back9_start, len(tokens)):
-                ttype, tval = tokens[i]
-                if ttype in ("num", "dash"):
-                    back_data.append(tval)
-                elif ttype == "symbol":
-                    back_data.append(("SYM",))
-                elif ttype == "summary":
-                    back_data.append(("SUM",))
-                elif ttype == "frac":
-                    back_data.append(("FRAC",))
-
-            logger.debug("Back 9 raw data (%d): %s", len(back_data), back_data[:60])
-
-            # Consume hole numbers 10-18
-            idx = 0
-            back_holes = []
-            while idx < len(back_data):
-                v = back_data[idx]
-                if isinstance(v, int) and 10 <= v <= 18:
-                    back_holes.append(v)
-                    idx += 1
-                elif isinstance(v, tuple):
-                    idx += 1  # skip markers
+            back = []
+            if len(groups) > 1:
+                g = groups[1]
+                if len(g) > 9:
+                    # First value is the Out total — skip it
+                    back = g[1:10]
                 else:
-                    break
+                    back = g[:9]
 
-            num_back = len(back_holes)
-            logger.debug("Back 9 holes found: %s", back_holes)
+            return front, back
 
-            def consume_n_values(start, n):
-                """Consume n numeric/dash values, skipping markers and symbols."""
-                vals = []
-                pos = start
-                while pos < len(back_data) and len(vals) < n:
-                    v = back_data[pos]
-                    if isinstance(v, tuple):
-                        pos += 1  # skip SUM/FRAC/SYM markers
-                        continue
-                    vals.append(v)
-                    pos += 1
-                # Skip trailing summary values (up to 2: "In" total + grand total)
-                skipped = 0
-                while pos < len(back_data) and skipped < 2:
-                    v = back_data[pos]
-                    if isinstance(v, tuple):
-                        pos += 1
-                        skipped += 1
-                    elif len(vals) >= n:
-                        pos += 1
-                        skipped += 1
-                    else:
-                        break
-                return vals, pos
+        front_par, back_par = extract_front_back(sections.get("par", []))
+        front_score, back_score = extract_front_back(sections.get("score", []))
 
-            if num_back > 0:
-                # Skip any summary markers after holes
-                while idx < len(back_data) and isinstance(back_data[idx], tuple):
-                    idx += 1
-
-                # Back 9 stat order matches front: par, score, fairway, gir, putts
-                # We only keep par and score
-                back_par, idx = consume_n_values(idx, num_back)
-                back_score, idx = consume_n_values(idx, num_back)
-                # Remaining rows (fairway, gir, putts) are consumed but ignored
-
-            logger.debug("Back 9 par: %s", back_par)
-            logger.debug("Back 9 score: %s", back_score)
+        logger.debug("Front par (%d): %s", len(front_par), front_par)
+        logger.debug("Back par (%d): %s", len(back_par), back_par)
+        logger.debug("Front score (%d): %s", len(front_score), front_score)
+        logger.debug("Back score (%d): %s", len(back_score), back_score)
 
         # === Combine front + back into 18-hole arrays ===
         def pad9(vals):
             """Pad/trim a list to exactly 9 values."""
             return (vals + [None] * 9)[:9]
 
-        par_vals = pad9(front.get("par", [])) + pad9(back_par if back9_start else [])
-        score_vals = pad9(front.get("score", [])) + pad9(back_score if back9_start else [])
+        par_vals = pad9(front_par) + pad9(back_par)
+        score_vals = pad9(front_score) + pad9(back_score)
 
         logger.debug("Combined 18 - par: %s", par_vals)
         logger.debug("Combined 18 - score: %s", score_vals)
@@ -591,9 +490,8 @@ class GarminClient:
             logger.info("Applying corrected pars from course database for '%s'",
                         scorecard.course_name)
             for hole in scorecard.holes:
-                idx = hole.hole_number - 1
-                if idx < len(correct_pars):
-                    hole.par = correct_pars[idx % len(correct_pars)]
+                # Use modulo so 9-hole course pars wrap to cover holes 10-18
+                hole.par = correct_pars[(hole.hole_number - 1) % len(correct_pars)]
 
             tee_box = get_tee_box(scorecard.course_name, garmin_tee)
             if tee_box:
