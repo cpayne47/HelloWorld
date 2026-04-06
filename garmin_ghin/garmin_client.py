@@ -49,6 +49,14 @@ class GarminClient:
         options.add_argument("--no-service-autorun")
         options.add_argument("--password-store=basic")
 
+        # Disable password save prompts
+        prefs = {
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
+            "profile.password_manager_leak_detection": False,
+        }
+        options.add_experimental_option("prefs", prefs)
+
         # Use a persistent profile directory so login sessions survive between runs.
         # This avoids re-entering credentials every time.
         profile_dir = Path.home() / ".garmin_ghin" / "chrome_profile"

@@ -43,6 +43,14 @@ class GHINClient:
         options.add_argument("--no-service-autorun")
         options.add_argument("--password-store=basic")
 
+        # Disable password save prompts
+        prefs = {
+            "credentials_enable_service": False,
+            "profile.password_manager_enabled": False,
+            "profile.password_manager_leak_detection": False,
+        }
+        options.add_experimental_option("prefs", prefs)
+
         # Separate persistent profile for GHIN (don't share with Garmin)
         profile_dir = Path.home() / ".garmin_ghin" / "chrome_profile_ghin"
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -67,20 +75,60 @@ class GHINClient:
         self._driver = driver
         return driver
 
+    def _is_logged_in(self, driver) -> bool:
+        """Check if we're logged into GHIN by looking at the page content."""
+        try:
+            page_text = driver.find_element("tag name", "body").text.lower()
+            url = driver.current_url.lower()
+            # Check for authenticated indicators
+            indicators = ["post score", "post a score", "my stats", "handicap index",
+                          "recent scores", "score history", "round history"]
+            for indicator in indicators:
+                if indicator in page_text:
+                    logger.debug("Login detected via text: '%s'", indicator)
+                    return True
+            # Check if URL suggests we're past login
+            if "/profile" in url or "/golfer" in url:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _dismiss_cookie_consent(self, driver) -> None:
+        """Click 'Accept all cookies' if the consent banner appears."""
+        try:
+            buttons = driver.find_elements("tag name", "button")
+            for btn in buttons:
+                btn_text = btn.text.strip().lower()
+                if "accept all" in btn_text or "accept cookies" in btn_text:
+                    btn.click()
+                    logger.info("Dismissed cookie consent: '%s'", btn.text.strip())
+                    time.sleep(1)
+                    return
+            # Also try common cookie consent selectors
+            for selector in ["#onetrust-accept-btn-handler", ".accept-cookies",
+                             "[data-testid='accept-cookies']"]:
+                try:
+                    el = driver.find_element("css selector", selector)
+                    el.click()
+                    logger.info("Dismissed cookie consent via %s", selector)
+                    time.sleep(1)
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     def _login(self, driver) -> None:
         """Log into GHIN if not already logged in."""
         driver.get(GHIN_HOME_URL)
         time.sleep(5)
 
-        # Check if already logged in — look for signs of an authenticated session
-        page_text = driver.find_element("tag name", "body").text
-        current_url = driver.current_url
-        logger.debug("GHIN page URL: %s", current_url)
-        logger.debug("GHIN page text (first 500): %s", page_text[:500])
+        # Handle cookie consent if it appears
+        self._dismiss_cookie_consent(driver)
 
-        # If we see the GHIN number or "Post Score" or "My Stats", we're logged in
-        if self._config.ghin_number in page_text or "Post Score" in page_text \
-                or "My Stats" in page_text or "post a score" in page_text.lower():
+        # Check if already logged in
+        if self._is_logged_in(driver):
             logger.info("Already logged into GHIN")
             print("Already logged into GHIN.")
             return
@@ -89,6 +137,9 @@ class GHINClient:
         logger.info("Not logged in, navigating to GHIN login...")
         driver.get(GHIN_LOGIN_URL)
         time.sleep(5)
+
+        # Handle cookie consent on login page too
+        self._dismiss_cookie_consent(driver)
 
         print("Logging into GHIN...")
         try:
@@ -172,8 +223,7 @@ class GHINClient:
 
             # If Enter didn't work, try finding and clicking the button
             time.sleep(3)
-            page_text = driver.find_element("tag name", "body").text
-            if "Post Score" not in page_text and "My Stats" not in page_text:
+            if not self._is_logged_in(driver):
                 # Enter key might not have worked — try clicking a button
                 for selector in ["css:button[type='submit']", "css:button.login-btn",
                                  "css:input[type='submit']"]:
@@ -201,14 +251,18 @@ class GHINClient:
             # Wait for login to complete
             for i in range(20):
                 time.sleep(2)
-                page_text = driver.find_element("tag name", "body").text
-                if "Post Score" in page_text or "My Stats" in page_text \
-                        or self._config.ghin_number in page_text \
-                        or "post a score" in page_text.lower():
+                if self._is_logged_in(driver):
                     logger.info("GHIN login successful after %ds", (i+1)*2)
                     print("GHIN login successful.")
                     return
-                logger.debug("Waiting for GHIN login... (%ds)", (i+1)*2)
+                # Log what we see for debugging
+                try:
+                    url = driver.current_url
+                    text = driver.find_element("tag name", "body").text[:200]
+                    logger.debug("Waiting for GHIN login... (%ds) url=%s text=%s",
+                                 (i+1)*2, url, text)
+                except Exception:
+                    pass
 
             print(
                 "GHIN login may have timed out.\n"
