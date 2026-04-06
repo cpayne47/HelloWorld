@@ -659,49 +659,36 @@ class GHINClient:
 
         time.sleep(1)
 
-        # ── Step 8: Click "Enter Hole-by-Hole Score" button ──
-        logger.info("Looking for Enter Hole-by-Hole Score button...")
+        # ── Step 8: Click "ENTER HOLE-BY-HOLE SCORE" button ──
+        # This button is often below the fold, so scroll into view before clicking.
+        logger.info("Looking for ENTER HOLE-BY-HOLE SCORE button...")
         hbh_entered = False
 
         try:
-            # Log all visible buttons/links for debugging
+            # Scroll to bottom first to ensure the button is in the DOM
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            time.sleep(1)
+
             all_els = driver.find_elements("css selector",
                 "button, a, input[type='submit'], div[role='button'], "
                 "span[class*='btn'], div[class*='btn'], div[class*='button']")
-            visible_buttons = [(el.tag_name, el.text.strip()) for el in all_els
-                               if el.text.strip() and el.is_displayed()]
-            logger.info("Visible clickable elements: %s", visible_buttons[:30])
 
-            # Search for the enter hole-by-hole button with broad matching
-            search_terms = ["enter hole", "hole-by-hole", "hole by hole",
-                            "enter scores", "enter score", "hole-by-hole score"]
+            search_terms = ["enter hole", "hole-by-hole score"]
             for el in all_els:
                 el_text = el.text.strip().lower()
-                if not el_text or not el.is_displayed():
+                if not el_text:
                     continue
                 for term in search_terms:
                     if term in el_text:
-                        driver.execute_script("arguments[0].click();", el)
+                        # Scroll into view and click
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block: 'center'}); "
+                            "arguments[0].click();", el)
                         hbh_entered = True
-                        logger.info("Clicked HBH button: '%s' (tag=%s, matched='%s')",
-                                    el.text.strip(), el.tag_name, term)
+                        logger.info("Clicked HBH button: '%s' (tag=%s)", el.text.strip(), el.tag_name)
                         break
                 if hbh_entered:
                     break
-
-            if not hbh_entered:
-                # Try page text to find the exact button label
-                page_text = driver.find_element("tag name", "body").text
-                logger.info("Page text for HBH search (1000): %s", page_text[:1000])
-
-                # Maybe it's just a generic "Continue" or "Next" button
-                for el in all_els:
-                    el_text = el.text.strip().lower()
-                    if el_text in ("continue", "next", "submit"):
-                        driver.execute_script("arguments[0].click();", el)
-                        hbh_entered = True
-                        logger.info("Clicked fallback button: '%s'", el.text.strip())
-                        break
 
             if not hbh_entered:
                 # Check if score input fields are already visible (no button needed)
