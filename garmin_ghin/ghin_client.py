@@ -650,66 +650,14 @@ class GHINClient:
 
         time.sleep(1)
 
-        # ── Step 7: Set date played ──
+        # ── Step 7: Date played ──
+        # GHIN defaults to today's date, which is correct for same-day posting.
+        # Skip date manipulation to avoid triggering the calendar picker.
         target_date = scorecard.date_played.strftime("%m/%d/%Y")
-        logger.info("Setting date to: %s", target_date)
+        report["selections"]["date"] = f"{target_date} (using GHIN default — not modified)"
+        logger.info("Date: %s — leaving GHIN default (same-day posting assumed)", target_date)
 
-        try:
-            date_inputs = driver.find_elements("css selector",
-                "input[type='date'], input[type='text'][placeholder*='date'], "
-                "input[placeholder*='MM'], input[placeholder*='mm/dd']")
-
-            if not date_inputs:
-                # Try finding any input near "Date Played" text
-                all_inputs = driver.find_elements("css selector", "input")
-                for inp in all_inputs:
-                    # Check value format — date fields often have MM/DD/YYYY
-                    val = inp.get_attribute("value") or ""
-                    if re.match(r"\d{2}/\d{2}/\d{4}", val):
-                        date_inputs = [inp]
-                        break
-
-            if date_inputs:
-                date_input = date_inputs[0]
-                current_val = date_input.get_attribute("value") or ""
-                logger.info("Current date value: %s, target: %s", current_val, target_date)
-
-                if current_val != target_date:
-                    # Clear and set the date
-                    driver.execute_script("arguments[0].value = '';", date_input)
-                    date_input.click()
-                    time.sleep(0.5)
-                    # Select all and replace
-                    date_input.send_keys(Keys.CONTROL + "a")
-                    date_input.send_keys(target_date)
-                    # Tab out to trigger change event
-                    date_input.send_keys(Keys.TAB)
-                    time.sleep(0.5)
-
-                    # Verify
-                    new_val = date_input.get_attribute("value") or ""
-                    if new_val == target_date:
-                        report["selections"]["date"] = target_date
-                    else:
-                        # Try React-style value setting
-                        driver.execute_script("""
-                            var el = arguments[0];
-                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-                                window.HTMLInputElement.prototype, 'value').set;
-                            nativeInputValueSetter.call(el, arguments[1]);
-                            el.dispatchEvent(new Event('input', { bubbles: true }));
-                            el.dispatchEvent(new Event('change', { bubbles: true }));
-                        """, date_input, target_date)
-                        time.sleep(0.5)
-                        report["selections"]["date"] = target_date + " (set via JS)"
-                else:
-                    report["selections"]["date"] = target_date + " (already correct)"
-            else:
-                report["issues"].append("Could not find date input field")
-        except Exception as e:
-            report["issues"].append(f"Error setting date: {e}")
-
-        time.sleep(2)
+        time.sleep(1)
 
         # ── Step 8: Click "Enter Hole-by-Hole Score" button ──
         logger.info("Looking for Enter Hole-by-Hole Score button...")
