@@ -162,36 +162,37 @@ class GHINClient:
             pw_field.send_keys(self._config.password)
             logger.info("Entered password (length %d)", len(self._config.password))
 
-            # Find and click login button
-            login_btn = None
-            for selector in ["css:button[type='submit']", "css:button.login-btn",
-                             "css:input[type='submit']", "css:button:not([type='button'])"]:
-                method, value = selector.split(":", 1)
-                try:
-                    if method == "css":
-                        login_btn = driver.find_element("css selector", value)
-                    else:
-                        login_btn = driver.find_element(method, value)
-                    logger.info("Found login button via %s", selector)
-                    break
-                except Exception:
-                    continue
+            # Submit the form — try multiple approaches since GHIN is a React SPA
+            time.sleep(1)
 
-            if not login_btn:
-                # Try finding any button with "sign in" or "log in" text
-                buttons = driver.find_elements("tag name", "button")
-                for btn in buttons:
-                    btn_text = btn.text.strip().lower()
-                    if "sign in" in btn_text or "log in" in btn_text or "login" in btn_text:
-                        login_btn = btn
-                        logger.info("Found login button by text: '%s'", btn.text.strip())
+            # Approach 1: Press Enter in the password field
+            from selenium.webdriver.common.keys import Keys
+            pw_field.send_keys(Keys.RETURN)
+            logger.info("Sent Enter key from password field")
+
+            # If Enter didn't work, try finding and clicking the button
+            time.sleep(3)
+            page_text = driver.find_element("tag name", "body").text
+            if "Post Score" not in page_text and "My Stats" not in page_text:
+                # Enter key might not have worked — try clicking a button
+                for selector in ["css:button[type='submit']", "css:button.login-btn",
+                                 "css:input[type='submit']"]:
+                    try:
+                        btn = driver.find_element("css selector", selector.split(":", 1)[1])
+                        driver.execute_script("arguments[0].click();", btn)
+                        logger.info("Clicked login button via JS: %s", selector)
                         break
-
-            if not login_btn:
-                raise RuntimeError("Could not find login button on GHIN page")
-
-            login_btn.click()
-            logger.info("Clicked login button")
+                    except Exception:
+                        continue
+                else:
+                    # Try any button with login-ish text
+                    buttons = driver.find_elements("tag name", "button")
+                    for btn in buttons:
+                        btn_text = btn.text.strip().lower()
+                        if "sign in" in btn_text or "log in" in btn_text or "login" in btn_text:
+                            driver.execute_script("arguments[0].click();", btn)
+                            logger.info("Clicked login button by text: '%s'", btn.text.strip())
+                            break
 
             # Switch back if in iframe
             if in_iframe:
