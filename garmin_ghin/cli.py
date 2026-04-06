@@ -112,17 +112,18 @@ def cmd_bulk(args) -> None:
                     nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
                     vs_par = scorecard.computed_total - scorecard.computed_par
 
-                    if args.step:
+                    stepping = args.step and (i + 1) >= args.start
+                    if stepping:
                         # Interactive debug mode: show full scorecard
                         print()
                         print("=" * 60)
                         print(scorecard.summary())
                         print("=" * 60)
-                        resp = input("\nType 'proceed' to save & continue, 'skip' to skip, 'quit' to stop: ").strip().lower()
-                        if resp == "quit":
+                        resp = input("\n[p]roceed  [s]kip  [q]uit: ").strip().lower()
+                        if resp in ("q", "quit"):
                             print("Stopping.")
                             break
-                        elif resp == "skip":
+                        elif resp in ("s", "skip"):
                             print("    -> Skipped (not saved)")
                             continue
 
@@ -133,13 +134,14 @@ def cmd_bulk(args) -> None:
                     saved += 1
                 else:
                     print(f"    -> 18 holes parsed but all dashes — no scores recorded")
-                    if args.step:
+                    stepping = args.step and (i + 1) >= args.start
+                    if stepping:
                         print()
                         print("=" * 60)
                         print(scorecard.summary())
                         print("=" * 60)
-                        resp = input("\nType 'proceed' to continue, 'quit' to stop: ").strip().lower()
-                        if resp == "quit":
+                        resp = input("\n[p]roceed  [q]uit: ").strip().lower()
+                        if resp in ("q", "quit"):
                             break
                     errors += 1
 
@@ -244,7 +246,11 @@ def main() -> None:
     )
     bulk_parser.add_argument(
         "--step", action="store_true",
-        help="Interactive debug mode: show full scorecard and wait for 'proceed' before continuing",
+        help="Interactive debug mode: show full scorecard and wait before continuing",
+    )
+    bulk_parser.add_argument(
+        "--start", type=int, default=1,
+        help="Start stepping from this scorecard number (1-based). Earlier ones auto-save.",
     )
 
     # history subcommand

@@ -60,16 +60,49 @@ class Scorecard:
     @property
     def nine_played(self) -> Optional[str]:
         """Return 'front', 'back', 'both', or None."""
-        played = {h.hole_number for h in self.played_holes}
-        front = played & set(range(1, 10))
-        back = played & set(range(10, 19))
-        if front and back:
+        front = [h for h in self.holes if h.hole_number <= 9 and h.played]
+        back = [h for h in self.holes if h.hole_number >= 10 and h.played]
+        if len(front) == 9 and len(back) == 9:
             return "both"
-        elif front:
+        elif len(front) == 9:
             return "front"
-        elif back:
+        elif len(back) == 9:
             return "back"
+        elif front and not back:
+            return "front"
+        elif back and not front:
+            return "back"
+        elif front and back:
+            return "both"
         return None
+
+    def drop_incomplete_nine(self) -> None:
+        """If one nine is complete and the other is partial, drop the partial scores.
+
+        For example, if all 9 back holes are played but only 4 front holes,
+        clear the front scores so the scorecard reads as a clean Back 9 round.
+        """
+        front = [h for h in self.holes if h.hole_number <= 9 and h.played]
+        back = [h for h in self.holes if h.hole_number >= 10 and h.played]
+
+        front_complete = len(front) == 9
+        back_complete = len(back) == 9
+
+        if front_complete and back_complete:
+            return  # Full 18 — keep everything
+        if not front and not back:
+            return  # Nothing played
+
+        if front_complete and not back_complete and back:
+            # Front is complete, back is partial — drop partial back scores
+            for h in self.holes:
+                if h.hole_number >= 10:
+                    h.score = None
+        elif back_complete and not front_complete and front:
+            # Back is complete, front is partial — drop partial front scores
+            for h in self.holes:
+                if h.hole_number <= 9:
+                    h.score = None
 
     @property
     def computed_total(self) -> int:

@@ -550,6 +550,9 @@ class GarminClient:
             logger.info("No course database entry for '%s' — using Garmin pars",
                         scorecard.course_name)
 
+        # Drop partial nine if one side is complete and the other isn't
+        scorecard.drop_incomplete_nine()
+
         scorecard.compute_stats()
         return scorecard
 
