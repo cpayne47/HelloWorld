@@ -296,6 +296,118 @@ def cmd_ghin_login(args) -> None:
         client.close()
 
 
+def cmd_ghin_post(args) -> None:
+    """Post a scorecard to GHIN (hole-by-hole).
+
+    By default runs in dry-run mode: fills the form but does NOT click POST SCORE.
+    """
+    from .config import load_config
+    from .ghin_client import GHINClient
+    from .scorecard_db import load_scorecard, list_scorecards
+
+    config = load_config()
+    if not config.ghin:
+        print("GHIN credentials not configured. Add GHIN_NUMBER and GHIN_PASSWORD to .env")
+        sys.exit(1)
+
+    # Load the scorecard
+    if args.id:
+        scorecard = load_scorecard(args.id)
+        if not scorecard:
+            print(f"No scorecard found with id={args.id}")
+            sys.exit(1)
+    else:
+        # Default: most recent scorecard
+        recent = list_scorecards(limit=1)
+        if not recent:
+            print("No scorecards in database. Run 'sync' or 'bulk' first.")
+            sys.exit(1)
+        scorecard = load_scorecard(recent[0]["id"])
+
+    # Print what we're about to post
+    print("=" * 60)
+    print("SCORECARD TO POST TO GHIN")
+    print("=" * 60)
+    print(scorecard.summary())
+    print("=" * 60)
+    print()
+
+    if not scorecard.played_holes:
+        print("No played holes in this scorecard — nothing to post.")
+        sys.exit(1)
+
+    # Confirm before proceeding
+    if not args.yes:
+        resp = input("Proceed with GHIN form fill? [y/n]: ").strip().lower()
+        if resp not in ("y", "yes"):
+            print("Aborted.")
+            return
+
+    client = GHINClient(config.ghin)
+    try:
+        report = client.post_score(scorecard, dry_run=not args.post)
+
+        # Print report
+        print()
+        print("=" * 60)
+        print("GHIN POST SCORE REPORT")
+        print("=" * 60)
+        print(f"  Course:        {report['course']}")
+        print(f"  Date:          {report['date']}")
+        print(f"  Holes:         {report['holes_count']} ({report['nine_played']})")
+        print(f"  Total Score:   {report['total_score']}")
+        print(f"  Garmin Tee:    {report.get('garmin_tee', '-')}")
+        print()
+
+        sels = report.get("selections", {})
+        print("  SELECTIONS MADE:")
+        print(f"    Course:      {sels.get('course', 'NOT SET')}")
+        print(f"    Holes:       {sels.get('holes', 'NOT SET')}")
+        print(f"    Tees:        {sels.get('tee_selected', 'NOT SET')}")
+        if sels.get("tee_options_available"):
+            print(f"    Tee options:  {sels['tee_options_available']}")
+        print(f"    Score Type:  {sels.get('score_type', 'NOT SET')}")
+        print(f"    Date:        {sels.get('date', 'NOT SET')}")
+        print()
+
+        scores = sels.get("scores_entered", {})
+        if scores:
+            print(f"  SCORES ENTERED ({len(scores)} holes):")
+            # Display in a grid
+            front = [scores.get(h, "-") for h in range(1, 10)]
+            back = [scores.get(h, "-") for h in range(10, 19)]
+            print("    Front: " + "  ".join(f"{s:>3}" for s in front))
+            print("    Back:  " + "  ".join(f"{s:>3}" for s in back))
+            print(f"    Total: {sum(v for v in scores.values() if isinstance(v, int))}")
+
+        print()
+        status = report.get("status", "UNKNOWN")
+        msg = report.get("message", "")
+        print(f"  STATUS: {status}")
+        if msg:
+            print(f"  {msg}")
+
+        issues = report.get("issues", [])
+        if issues:
+            print()
+            print("  ISSUES / NOTES:")
+            for issue in issues:
+                print(f"    - {issue}")
+
+        print()
+        print("=" * 60)
+
+        if status == "READY_FOR_REVIEW":
+            print("\nReview the form in the browser.")
+            print("When ready, you can:")
+            print("  - Click POST SCORE manually in the browser")
+            print("  - Or re-run with --post flag to auto-submit")
+            input("\nPress Enter to close the browser...")
+
+    finally:
+        client.close()
+
+
 def cmd_fix_names() -> None:
     """Apply course name mappings from courses.json to existing DB records."""
     from .course_db import _load_db
@@ -391,6 +503,22 @@ def main() -> None:
     # ghin-login subcommand
     subparsers.add_parser("ghin-login", help="Test GHIN login")
 
+    # ghin-post subcommand
+    gp_parser = subparsers.add_parser("ghin-post",
+                                       help="Post a scorecard to GHIN (hole-by-hole)")
+    gp_parser.add_argument(
+        "--id", type=int, default=None,
+        help="Database ID of scorecard to post (default: most recent)",
+    )
+    gp_parser.add_argument(
+        "--post", action="store_true",
+        help="Actually click POST SCORE (default is dry-run: fill form only)",
+    )
+    gp_parser.add_argument(
+        "-y", "--yes", action="store_true",
+        help="Skip confirmation prompt",
+    )
+
     # fix-names subcommand
     subparsers.add_parser("fix-names",
                           help="Apply course name mappings from courses.json to existing DB records")
@@ -423,6 +551,8 @@ def main() -> None:
         cmd_sync(args)
     elif args.command == "ghin-login":
         cmd_ghin_login(args)
+    elif args.command == "ghin-post":
+        cmd_ghin_post(args)
     else:
         parser.print_help()
 

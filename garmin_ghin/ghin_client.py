@@ -5,16 +5,26 @@ including posting scores.
 """
 
 import logging
+import re
 import sys
 import time
 from pathlib import Path
 
 from .config import GHINConfig
+from .scorecard import Scorecard
 
 logger = logging.getLogger(__name__)
 
 GHIN_LOGIN_URL = "https://www.ghin.com/login"
 GHIN_HOME_URL = "https://www.ghin.com/"
+GHIN_POST_SCORE_URL = "https://www.ghin.com/post-score"
+
+# Courses considered "Home" — all others are "Away"
+HOME_COURSES = [
+    "desert mountain",
+    "poppy hills",
+    "lake wildwood",
+]
 
 
 class GHINClient:
@@ -309,6 +319,537 @@ class GHINClient:
         if self._driver:
             return self._driver.find_element("tag name", "body").text
         return ""
+
+    @staticmethod
+    def _is_home_course(course_name: str) -> bool:
+        """Check if a course should be scored as Home."""
+        name_lower = course_name.lower()
+        return any(home in name_lower for home in HOME_COURSES)
+
+    def _best_tee_match(self, tee_options: list[str], garmin_tee: str | None) -> str | None:
+        """Pick the best tee from GHIN dropdown options based on Garmin tee name.
+
+        Garmin tee names are like "White Tees", "Blue Tees", "Copper/White Tees".
+        GHIN options look like "Copper/White  69.5 / 123 / 72" or "Blue  71.2 / 130 / 72".
+        """
+        if not tee_options:
+            return None
+        if len(tee_options) == 1:
+            return tee_options[0]
+
+        if garmin_tee:
+            # Extract color words from Garmin tee name (e.g. "Copper/White Tees" -> ["copper", "white"])
+            garmin_colors = [w.lower().rstrip("s") for w in
+                            garmin_tee.replace("/", " ").replace("Tees", "").replace("Tee", "").split()
+                            if w.lower() not in ("tees", "tee", "men's", "women's")]
+
+            # Score each GHIN option by how many color words match
+            best_score = -1
+            best_option = None
+            for opt in tee_options:
+                opt_lower = opt.lower()
+                score = sum(1 for color in garmin_colors if color in opt_lower)
+                if score > best_score:
+                    best_score = score
+                    best_option = opt
+
+            if best_score > 0:
+                return best_option
+
+        # Fallback: return first option
+        return tee_options[0]
+
+    def post_score(self, scorecard: Scorecard, dry_run: bool = True) -> dict:
+        """Navigate the GHIN post-score form and fill it out with scorecard data.
+
+        Returns a dict summarizing all selections made for user review.
+        If dry_run is True (default), stops before clicking POST SCORE.
+        """
+        driver = self._ensure_browser()
+        self._login(driver)
+
+        from selenium.webdriver.common.keys import Keys
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.common.by import By
+
+        report = {
+            "course": scorecard.course_name,
+            "date": scorecard.date_played.isoformat(),
+            "nine_played": scorecard.nine_played,
+            "holes_count": scorecard.num_holes_played,
+            "total_score": scorecard.computed_total,
+            "garmin_tee": scorecard.garmin_tee_name or scorecard.tee_name,
+            "selections": {},
+            "issues": [],
+        }
+
+        # ── Step 1: Navigate to Post Score page ──
+        logger.info("Navigating to Post Score page...")
+        driver.get(GHIN_POST_SCORE_URL)
+        time.sleep(4)
+        self._dismiss_cookie_consent(driver)
+
+        # ── Step 2: Click HOLE-BY-HOLE SCORE tab ──
+        logger.info("Clicking HOLE-BY-HOLE SCORE tab...")
+        hbh_clicked = False
+        for attempt in range(3):
+            try:
+                links = driver.find_elements("css selector", "a, button, [role='tab'], div[class*='tab']")
+                for el in links:
+                    txt = el.text.strip().upper()
+                    if "HOLE-BY-HOLE" in txt or "HOLE BY HOLE" in txt:
+                        driver.execute_script("arguments[0].click();", el)
+                        hbh_clicked = True
+                        logger.info("Clicked HOLE-BY-HOLE SCORE tab")
+                        break
+                if hbh_clicked:
+                    break
+            except Exception as e:
+                logger.debug("Attempt %d to find HBH tab: %s", attempt, e)
+            time.sleep(2)
+
+        if not hbh_clicked:
+            report["issues"].append("Could not find HOLE-BY-HOLE SCORE tab")
+            return report
+
+        time.sleep(3)
+
+        # ── Step 3: Select course ──
+        logger.info("Selecting course: %s", scorecard.course_name)
+        course_selected = False
+
+        # First try: look for the course in the recently played / my courses list
+        try:
+            # Look for course rows — they typically contain the course name text
+            body_text = driver.find_element("tag name", "body").text
+            logger.debug("Post score page text (500): %s", body_text[:500])
+
+            # Try clicking on course name text directly
+            course_name = scorecard.course_name
+            # GHIN uses "Desert Mountain" + "Apache" as separate elements
+            # Try to find a clickable element containing the GHIN course name
+            all_clickable = driver.find_elements("css selector",
+                "a, button, tr, div[class*='course'], div[class*='row'], li")
+
+            # Build search terms from the course name
+            # e.g. "Desert Mountain Apache" -> try "Apache", "Desert Mountain"
+            name_parts = course_name.split()
+            # Try exact match first, then partial
+            for el in all_clickable:
+                el_text = el.text.strip()
+                if not el_text:
+                    continue
+                el_lower = el_text.lower()
+                # Check if this element's text matches our course
+                if course_name.lower() in el_lower:
+                    driver.execute_script("arguments[0].click();", el)
+                    course_selected = True
+                    logger.info("Selected course by full name: '%s'", el_text[:60])
+                    break
+
+            # If no exact match, try matching the distinguishing part (e.g. "Apache")
+            if not course_selected:
+                # For "Desert Mountain Apache", the GHIN list shows "Desert Mountain" on left, "Apache" on right
+                # Try to find just the sub-name (last word or words after common prefix)
+                ghin_parts = course_name.split()
+                # Try the last word first (e.g. "Apache", "Seven", "Outlaw")
+                for search_term in [ghin_parts[-1]] if len(ghin_parts) > 1 else [course_name]:
+                    for el in all_clickable:
+                        el_text = el.text.strip()
+                        if search_term.lower() in el_text.lower() and len(el_text) < 100:
+                            driver.execute_script("arguments[0].click();", el)
+                            course_selected = True
+                            logger.info("Selected course by partial match '%s': '%s'",
+                                        search_term, el_text[:60])
+                            break
+                    if course_selected:
+                        break
+
+            # If still not found, try the search box
+            if not course_selected:
+                search_inputs = driver.find_elements("css selector",
+                    "input[placeholder*='COURSE'], input[placeholder*='course'], input[type='search']")
+                if search_inputs:
+                    search_input = search_inputs[0]
+                    search_input.clear()
+                    search_input.send_keys(course_name)
+                    logger.info("Typed course name in search box")
+                    time.sleep(3)
+                    # Click first result
+                    results = driver.find_elements("css selector",
+                        "div[class*='result'], div[class*='option'], li, tr")
+                    for el in results:
+                        el_text = el.text.strip()
+                        if el_text and any(p.lower() in el_text.lower() for p in name_parts[-2:]):
+                            driver.execute_script("arguments[0].click();", el)
+                            course_selected = True
+                            logger.info("Selected course from search results: '%s'", el_text[:60])
+                            break
+
+        except Exception as e:
+            logger.error("Error selecting course: %s", e)
+            report["issues"].append(f"Error selecting course: {e}")
+
+        if not course_selected:
+            report["issues"].append(f"Could not find course '{course_name}' in GHIN list")
+            return report
+
+        report["selections"]["course"] = course_name
+        time.sleep(3)
+
+        # ── Step 4: Select number of holes ──
+        nine = scorecard.nine_played
+        target_holes = "18" if nine == "both" else "9"
+        logger.info("Selecting %s holes...", target_holes)
+
+        try:
+            buttons = driver.find_elements("css selector", "button, div[role='button'], span, a")
+            for btn in buttons:
+                btn_text = btn.text.strip()
+                if f"{target_holes} Hole" in btn_text or btn_text == f"{target_holes} Holes":
+                    driver.execute_script("arguments[0].click();", btn)
+                    logger.info("Selected %s Holes", target_holes)
+                    report["selections"]["holes"] = f"{target_holes} Holes"
+                    break
+            else:
+                # It may already be selected by default (18 is usually default)
+                report["selections"]["holes"] = f"{target_holes} Holes (default assumed)"
+                logger.info("Holes button not found — may already be %s", target_holes)
+        except Exception as e:
+            report["issues"].append(f"Error selecting holes: {e}")
+
+        time.sleep(2)
+
+        # ── Step 5: Select tees ──
+        logger.info("Reading tee options from dropdown...")
+        tee_options = []
+        selected_tee = None
+
+        try:
+            # Find the tee dropdown/select
+            selects = driver.find_elements("css selector", "select")
+            tee_select = None
+            for sel in selects:
+                # Check if this select has tee-related options
+                options = sel.find_elements("tag name", "option")
+                for opt in options:
+                    opt_text = opt.text.strip()
+                    if "/" in opt_text and any(c.isdigit() for c in opt_text):
+                        tee_select = sel
+                        break
+                if tee_select:
+                    break
+
+            if tee_select:
+                options = tee_select.find_elements("tag name", "option")
+                for opt in options:
+                    opt_text = opt.text.strip()
+                    if opt_text and opt_text != "Select Tees" and opt_text != "":
+                        tee_options.append(opt_text)
+                logger.info("Found %d tee options: %s", len(tee_options), tee_options)
+
+                # Pick best match
+                garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
+                best = self._best_tee_match(tee_options, garmin_tee)
+
+                if best:
+                    # Click the matching option
+                    for opt in options:
+                        if opt.text.strip() == best:
+                            opt.click()
+                            selected_tee = best
+                            logger.info("Selected tee: %s (matched from Garmin tee: %s)",
+                                        best, garmin_tee)
+                            break
+            else:
+                # Try clicking a dropdown that opens a custom select
+                dropdowns = driver.find_elements("css selector",
+                    "div[class*='select'], div[class*='dropdown'], div[class*='tee']")
+                for dd in dropdowns:
+                    dd_text = dd.text.strip()
+                    if "/" in dd_text and any(c.isdigit() for c in dd_text):
+                        # This looks like it already shows a tee — click to open
+                        driver.execute_script("arguments[0].click();", dd)
+                        time.sleep(1)
+                        # Read options
+                        option_els = driver.find_elements("css selector",
+                            "div[class*='option'], li[class*='option'], div[class*='menu'] div")
+                        for oel in option_els:
+                            ot = oel.text.strip()
+                            if ot and "/" in ot:
+                                tee_options.append(ot)
+                        logger.info("Custom dropdown tee options: %s", tee_options)
+
+                        garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
+                        best = self._best_tee_match(tee_options, garmin_tee)
+                        if best:
+                            for oel in option_els:
+                                if oel.text.strip() == best:
+                                    driver.execute_script("arguments[0].click();", oel)
+                                    selected_tee = best
+                                    break
+                        break
+
+        except Exception as e:
+            report["issues"].append(f"Error selecting tees: {e}")
+            logger.error("Error selecting tees: %s", e)
+
+        report["selections"]["tee_options_available"] = tee_options
+        report["selections"]["tee_selected"] = selected_tee or "UNKNOWN"
+        if not selected_tee:
+            report["issues"].append("Could not select tees — may need manual selection")
+
+        time.sleep(1)
+
+        # ── Step 6: Select Home / Away ──
+        is_home = self._is_home_course(scorecard.course_name)
+        target_type = "Home" if is_home else "Away"
+        logger.info("Selecting score type: %s", target_type)
+
+        try:
+            buttons = driver.find_elements("css selector", "button, div[role='button'], span, a")
+            for btn in buttons:
+                btn_text = btn.text.strip()
+                if btn_text == target_type:
+                    driver.execute_script("arguments[0].click();", btn)
+                    logger.info("Selected score type: %s", target_type)
+                    report["selections"]["score_type"] = target_type
+                    break
+            else:
+                report["selections"]["score_type"] = f"{target_type} (button not found, may be default)"
+        except Exception as e:
+            report["issues"].append(f"Error selecting Home/Away: {e}")
+
+        time.sleep(1)
+
+        # ── Step 7: Set date played ──
+        target_date = scorecard.date_played.strftime("%m/%d/%Y")
+        logger.info("Setting date to: %s", target_date)
+
+        try:
+            date_inputs = driver.find_elements("css selector",
+                "input[type='date'], input[type='text'][placeholder*='date'], "
+                "input[placeholder*='MM'], input[placeholder*='mm/dd']")
+
+            if not date_inputs:
+                # Try finding any input near "Date Played" text
+                all_inputs = driver.find_elements("css selector", "input")
+                for inp in all_inputs:
+                    # Check value format — date fields often have MM/DD/YYYY
+                    val = inp.get_attribute("value") or ""
+                    if re.match(r"\d{2}/\d{2}/\d{4}", val):
+                        date_inputs = [inp]
+                        break
+
+            if date_inputs:
+                date_input = date_inputs[0]
+                current_val = date_input.get_attribute("value") or ""
+                logger.info("Current date value: %s, target: %s", current_val, target_date)
+
+                if current_val != target_date:
+                    # Clear and set the date
+                    driver.execute_script("arguments[0].value = '';", date_input)
+                    date_input.click()
+                    time.sleep(0.5)
+                    # Select all and replace
+                    date_input.send_keys(Keys.CONTROL + "a")
+                    date_input.send_keys(target_date)
+                    # Tab out to trigger change event
+                    date_input.send_keys(Keys.TAB)
+                    time.sleep(0.5)
+
+                    # Verify
+                    new_val = date_input.get_attribute("value") or ""
+                    if new_val == target_date:
+                        report["selections"]["date"] = target_date
+                    else:
+                        # Try React-style value setting
+                        driver.execute_script("""
+                            var el = arguments[0];
+                            var nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            nativeInputValueSetter.call(el, arguments[1]);
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        """, date_input, target_date)
+                        time.sleep(0.5)
+                        report["selections"]["date"] = target_date + " (set via JS)"
+                else:
+                    report["selections"]["date"] = target_date + " (already correct)"
+            else:
+                report["issues"].append("Could not find date input field")
+        except Exception as e:
+            report["issues"].append(f"Error setting date: {e}")
+
+        time.sleep(2)
+
+        # ── Step 8: Click "Enter Hole-by-Hole Score" button ──
+        logger.info("Looking for Enter Hole-by-Hole Score button...")
+        hbh_entered = False
+
+        try:
+            buttons = driver.find_elements("css selector", "button, a, input[type='submit']")
+            for btn in buttons:
+                btn_text = btn.text.strip().lower()
+                if "enter hole" in btn_text or "hole-by-hole" in btn_text or "hole by hole" in btn_text:
+                    driver.execute_script("arguments[0].click();", btn)
+                    hbh_entered = True
+                    logger.info("Clicked: '%s'", btn.text.strip())
+                    break
+
+            if not hbh_entered:
+                # The form might already show the scorecard grid (no intermediate button)
+                # Check if score input fields are already visible
+                score_inputs = driver.find_elements("css selector",
+                    "input[type='number'], input[type='text'][class*='score'], "
+                    "input[class*='score'], td input")
+                if len(score_inputs) >= 9:
+                    hbh_entered = True
+                    logger.info("Score input fields already visible (%d found)", len(score_inputs))
+
+        except Exception as e:
+            report["issues"].append(f"Error entering hole-by-hole: {e}")
+
+        if not hbh_entered:
+            report["issues"].append("Could not find Enter Hole-by-Hole button or score inputs")
+            return report
+
+        time.sleep(3)
+
+        # ── Step 9: Fill in hole-by-hole scores ──
+        logger.info("Filling in hole-by-hole scores...")
+        played_holes = scorecard.played_holes
+        scores_entered = {}
+
+        try:
+            # The GHIN scorecard grid has SCORE rows for Front 9 and Back 9
+            # Each has input fields for holes 1-9 and 10-18
+            # Find all score input fields in the grid
+
+            # Try finding inputs in the SCORE row by looking at table structure
+            score_inputs = driver.find_elements("css selector",
+                "input[type='number'], input[type='tel'], "
+                "td input, input[class*='score'], input[aria-label*='score'], "
+                "input[aria-label*='Score'], input[name*='score']")
+
+            if not score_inputs:
+                # Broader search
+                score_inputs = driver.find_elements("css selector", "table input, .scorecard input")
+
+            if not score_inputs:
+                # Even broader — find all text/number inputs on the page
+                all_inputs = driver.find_elements("css selector", "input")
+                score_inputs = [inp for inp in all_inputs
+                                if inp.get_attribute("type") in ("text", "number", "tel", "")
+                                and inp.is_displayed()
+                                and inp.get_attribute("readonly") is None]
+
+            logger.info("Found %d potential score input fields", len(score_inputs))
+
+            # We expect 18 inputs for 18 holes (or 9 for 9 holes)
+            # Filter to just the ones that appear to be in the score entry area
+            # The GHIN form typically has Front 9 inputs then Back 9 inputs
+            if len(score_inputs) >= 18:
+                # Assume first 18 are the hole score inputs (may include summary fields)
+                # Check: GHIN has SCORE row with 9 inputs + OUT summary, then 9 inputs + IN + TOTAL
+                # The summary cells are usually read-only
+                writable_inputs = []
+                for inp in score_inputs:
+                    readonly = inp.get_attribute("readonly")
+                    disabled = inp.get_attribute("disabled")
+                    tabindex = inp.get_attribute("tabindex")
+                    if readonly or disabled:
+                        continue
+                    # Check if it looks like a score cell (not a summary cell)
+                    writable_inputs.append(inp)
+
+                logger.info("Found %d writable score inputs", len(writable_inputs))
+                score_inputs = writable_inputs
+
+            # Map holes to inputs
+            # For 18-hole rounds: inputs 0-8 = holes 1-9, inputs 9-17 = holes 10-18
+            # For 9-hole front: inputs 0-8 = holes 1-9
+            # For 9-hole back: inputs 0-8 = holes 10-18 (on the Back 9 section)
+            nine = scorecard.nine_played
+
+            if nine == "both" and len(score_inputs) >= 18:
+                # Fill all 18
+                for i, h in enumerate(scorecard.holes):
+                    if h.played and i < len(score_inputs):
+                        inp = score_inputs[i]
+                        inp.clear()
+                        inp.send_keys(str(h.score))
+                        scores_entered[h.hole_number] = h.score
+                        time.sleep(0.15)
+            elif nine == "front" and len(score_inputs) >= 9:
+                for i in range(9):
+                    h = scorecard.holes[i]
+                    if h.played and i < len(score_inputs):
+                        inp = score_inputs[i]
+                        inp.clear()
+                        inp.send_keys(str(h.score))
+                        scores_entered[h.hole_number] = h.score
+                        time.sleep(0.15)
+            elif nine == "back" and len(score_inputs) >= 9:
+                # For back 9: if 18 inputs exist, use indices 9-17
+                # If only 9 inputs (9-hole mode), use indices 0-8
+                offset = 9 if len(score_inputs) >= 18 else 0
+                for i in range(9):
+                    h = scorecard.holes[9 + i]  # holes 10-18
+                    if h.played and (offset + i) < len(score_inputs):
+                        inp = score_inputs[offset + i]
+                        inp.clear()
+                        inp.send_keys(str(h.score))
+                        scores_entered[h.hole_number] = h.score
+                        time.sleep(0.15)
+            else:
+                report["issues"].append(
+                    f"Input count mismatch: found {len(score_inputs)} inputs for "
+                    f"{nine} nine ({scorecard.num_holes_played} holes)")
+
+            logger.info("Entered scores for %d holes: %s", len(scores_entered), scores_entered)
+
+        except Exception as e:
+            report["issues"].append(f"Error filling scores: {e}")
+            logger.error("Error filling scores: %s", e, exc_info=True)
+
+        report["selections"]["scores_entered"] = scores_entered
+        report["scores_filled"] = len(scores_entered)
+
+        # ── Step 10: Read back the page state for verification ──
+        try:
+            page_text = driver.find_element("tag name", "body").text
+            # Try to extract the OUT/IN/TOTAL summary values
+            for marker in ["OUT", "IN", "TOTAL"]:
+                if marker in page_text:
+                    logger.debug("Page contains '%s' marker", marker)
+            report["page_summary"] = page_text[:500]
+        except Exception:
+            pass
+
+        if dry_run:
+            report["status"] = "READY_FOR_REVIEW"
+            report["message"] = "Scores filled. Review in browser. POST SCORE button NOT clicked."
+        else:
+            # Actually click POST SCORE
+            try:
+                buttons = driver.find_elements("css selector", "button, input[type='submit']")
+                for btn in buttons:
+                    if "post score" in btn.text.strip().lower():
+                        driver.execute_script("arguments[0].click();", btn)
+                        report["status"] = "POSTED"
+                        report["message"] = "POST SCORE button clicked!"
+                        logger.info("Clicked POST SCORE button")
+                        break
+                else:
+                    report["status"] = "POST_BUTTON_NOT_FOUND"
+                    report["issues"].append("Could not find POST SCORE button")
+            except Exception as e:
+                report["status"] = "POST_ERROR"
+                report["issues"].append(f"Error clicking POST SCORE: {e}")
+
+        return report
 
     def close(self) -> None:
         if self._driver:
