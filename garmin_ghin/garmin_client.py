@@ -345,10 +345,12 @@ class GarminClient:
                 if date_played != date.today():
                     break
 
-        # Extract tee name
+        # Extract tee name — appears as "White Tees", "Men's Tees", etc.
+        # on its own line, typically after "Stroke Play" and before "Hole"
         tee_name = None
         for line in non_empty:
-            if line.lower() in ("men's tees", "women's tees"):
+            low = line.lower()
+            if low.endswith(" tees") or low.endswith(" tee"):
                 tee_name = line
                 break
 
