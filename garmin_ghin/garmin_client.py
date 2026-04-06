@@ -413,56 +413,91 @@ class GarminClient:
         # === Collect all items per label ===
         sections = {}  # label -> list of (ttype, tval)
         current_label = None
-        for ttype, tval in tokens:
+        last_label_idx = 0  # token index of the last label we saw
+        for i, (ttype, tval) in enumerate(tokens):
             if ttype == "label":
                 current_label = tval
                 if current_label not in sections:
                     sections[current_label] = []
+                last_label_idx = i
                 continue
             if current_label is not None:
                 sections[current_label].append((ttype, tval))
 
-        # === Extract front 9 and back 9 from each label ===
-        def extract_front_back(items):
-            """Extract front 9 and back 9 values from a label's items.
+        logger.debug("Sections found: %s",
+                      {k: len(v) for k, v in sections.items()})
 
-            Two layouts exist in Garmin's page text:
-              1. With summaries (Hole row): values separated by Out/In/Total markers
-                 → split at summary markers into groups
-              2. Without summaries (Par/Score rows): just raw numbers
-                 → positional: front=[0:9], Out total=[9], back=[10:19]
-            """
-            has_summaries = any(t == "summary" for t, v in items)
+        # === Extract front 9 from labeled sections ===
+        # Front 9 is always the first 9 num/dash values in each label.
+        def get_first_9(items):
+            vals = [tval for ttype, tval in items if ttype in ("num", "dash")]
+            return vals[:9]
 
-            if has_summaries:
-                # Split at summary markers into groups of data values
-                groups = [[]]
-                for ttype, tval in items:
-                    if ttype == "summary":
-                        groups.append([])
-                    elif ttype in ("num", "dash"):
-                        groups[-1].append(tval)
+        front_par = get_first_9(sections.get("par", []))
+        front_score = get_first_9(sections.get("score", []))
 
-                front = groups[0][:9]
-                back = []
-                if len(groups) > 1:
-                    g = groups[1]
-                    if len(g) > 9:
-                        back = g[1:10]  # skip Out total
-                    else:
-                        back = g[:9]
-            else:
-                # No summaries — use positional indexing
-                # Layout: 9 front values, Out total, 9 back values, In total, Grand total
-                values = [tval for ttype, tval in items if ttype in ("num", "dash")]
-                front = values[:9]
-                # Skip Out total at index 9, back 9 starts at index 10
-                back = values[10:19] if len(values) > 10 else []
+        # === Extract back 9: try two layouts ===
+        #
+        # Layout B (inline): Each label has both front and back inline.
+        #   Par section has 21+ values: front(9) + Out total(1) + back(9) + In(1) + Tot(1)
+        #   → back = values[10:19]
+        #
+        # Layout A (separate block): Front 9 has labels, back 9 is an
+        #   unlabeled block after all labels. Each label only has ~10 values.
+        #   → Find 10,11,...,18 in token stream, then par(9)+totals(2), score(9)+totals(2)
 
-            return front, back
+        par_all = [tval for t, tval in sections.get("par", []) if t in ("num", "dash")]
+        score_all = [tval for t, tval in sections.get("score", []) if t in ("num", "dash")]
 
-        front_par, back_par = extract_front_back(sections.get("par", []))
-        front_score, back_score = extract_front_back(sections.get("score", []))
+        back_par = []
+        back_score = []
+
+        # Try Layout B first: inline back 9 within labels
+        if len(par_all) > 12:
+            logger.debug("Layout B detected (par has %d values)", len(par_all))
+            back_par = par_all[10:19]
+        if len(score_all) > 12:
+            back_score = score_all[10:19]
+
+        # Fallback: Layout A — find unlabeled back 9 block in token stream
+        if not back_par:
+            logger.debug("Layout B back par empty, trying Layout A (unlabeled block)")
+            # Search for hole 10 followed by 11 anywhere in the token stream
+            back9_token_idx = None
+            for i in range(len(tokens) - 1):
+                ttype, tval = tokens[i]
+                if ttype == "num" and tval == 10:
+                    # Verify next numeric token is 11
+                    for j in range(i + 1, min(i + 4, len(tokens))):
+                        jt, jv = tokens[j]
+                        if jt == "num" and jv == 11:
+                            back9_token_idx = i
+                            break
+                        elif jt == "num":
+                            break
+                    if back9_token_idx is not None:
+                        break
+
+            if back9_token_idx is not None:
+                # Collect only num/dash values from back 9 onward
+                back_nums = [tval for ttype, tval in tokens[back9_token_idx:]
+                             if ttype in ("num", "dash")]
+
+                # Skip hole numbers 10-18
+                skip = 0
+                while skip < len(back_nums) and isinstance(back_nums[skip], int) \
+                        and 10 <= back_nums[skip] <= 18:
+                    skip += 1
+
+                logger.debug("Layout A: back nums after holes (%d): %s",
+                             len(back_nums) - skip, back_nums[skip:skip+30])
+
+                # Stats are in order: par(9 vals + 2 totals), score(9 + 2), ...
+                back_par = back_nums[skip:skip + 9]
+                back_score = back_nums[skip + 11:skip + 20]
+
+                logger.debug("Layout A back par: %s", back_par)
+                logger.debug("Layout A back score: %s", back_score)
 
         logger.debug("Front par (%d): %s", len(front_par), front_par)
         logger.debug("Back par (%d): %s", len(back_par), back_par)
