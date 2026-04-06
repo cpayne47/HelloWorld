@@ -438,41 +438,82 @@ class GHINClient:
         # Build list of search terms to try, most specific first
         search_terms = []
         if ghin_list_text:
-            search_terms.append(ghin_list_text.lower())
-        search_terms.append(course_name.lower())
+            search_terms.append(ghin_list_text)
         # Also try the last word (e.g. "Apache" from "Desert Mountain Apache")
         parts = course_name.split()
         if len(parts) > 1:
-            search_terms.append(parts[-1].lower())
+            search_terms.append(parts[-1])
+        search_terms.append(course_name)
         logger.info("Course search terms: %s", search_terms)
 
         try:
-            # Read all course row elements from the list
-            all_clickable = driver.find_elements("css selector",
-                "a, button, tr, div[class*='course'], div[class*='row'], li")
+            # Log full page text so we can see the course list
+            page_text = driver.find_element("tag name", "body").text
+            logger.info("Course selection page text (1000): %s", page_text[:1000])
 
-            # Log what courses are visible on the page
-            course_entries = []
-            for el in all_clickable:
-                el_text = el.text.strip()
-                if el_text and 5 < len(el_text) < 120:
-                    course_entries.append(el_text)
-            logger.info("Course list entries found: %s", course_entries[:15])
-
-            # Try each search term against list entries
+            # Use XPath to find elements by text content — works regardless of
+            # element type (div, span, a, etc.) and handles React SPAs well.
             for term in search_terms:
-                for el in all_clickable:
-                    el_text = el.text.strip()
-                    if not el_text or len(el_text) > 120:
-                        continue
-                    if term in el_text.lower():
+                try:
+                    # Find elements whose text contains our search term
+                    xpath = f"//*[contains(text(), '{term}')]"
+                    matches = driver.find_elements("xpath", xpath)
+                    logger.info("XPath search for '%s': found %d matches", term, len(matches))
+
+                    for el in matches:
+                        el_text = el.text.strip()
+                        tag = el.tag_name
+                        logger.debug("  Match: tag=%s text='%s'", tag, el_text[:80])
+
+                        # Click via JS — try the element, then walk up to find
+                        # the clickable row/container if needed
                         driver.execute_script(
-                            "arguments[0].scrollIntoView({block: 'center'}); "
-                            "arguments[0].click();", el)
-                        course_selected = True
-                        logger.info("Selected course: '%s' (matched term '%s')",
-                                    el_text[:60], term)
-                        break
+                            "arguments[0].scrollIntoView({block: 'center'});", el)
+                        time.sleep(0.5)
+
+                        # Click the element itself
+                        driver.execute_script("arguments[0].click();", el)
+                        time.sleep(2)
+
+                        # Verify we left the course selection page
+                        new_text = driver.find_element("tag name", "body").text
+                        if "select course" not in new_text.lower():
+                            course_selected = True
+                            logger.info("Selected course via '%s': tag=%s text='%s'",
+                                        term, tag, el_text[:60])
+                            break
+
+                        # Click didn't navigate — try the parent element
+                        logger.debug("Click on <%s> didn't navigate, trying parent...", tag)
+                        try:
+                            parent = el.find_element("xpath", "./..")
+                            driver.execute_script("arguments[0].click();", parent)
+                            time.sleep(2)
+                            new_text = driver.find_element("tag name", "body").text
+                            if "select course" not in new_text.lower():
+                                course_selected = True
+                                logger.info("Selected course via parent of '%s'", el_text[:60])
+                                break
+                        except Exception:
+                            pass
+
+                        # Try grandparent
+                        logger.debug("Parent click didn't navigate, trying grandparent...")
+                        try:
+                            grandparent = el.find_element("xpath", "./../..")
+                            driver.execute_script("arguments[0].click();", grandparent)
+                            time.sleep(2)
+                            new_text = driver.find_element("tag name", "body").text
+                            if "select course" not in new_text.lower():
+                                course_selected = True
+                                logger.info("Selected course via grandparent of '%s'", el_text[:60])
+                                break
+                        except Exception:
+                            pass
+
+                except Exception as e:
+                    logger.debug("XPath search for '%s' failed: %s", term, e)
+
                 if course_selected:
                     break
 
