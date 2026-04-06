@@ -378,12 +378,17 @@ class GHINClient:
 
     @staticmethod
     def _get_ghin_list_text(course_name: str) -> str | None:
-        """Look up the GHIN course list display text from courses.json."""
+        """Look up the GHIN course list display text from courses.json.
+
+        Matches against both ghin_name and garmin_name, since the DB course_name
+        could be either depending on whether fix-names has been run.
+        """
         try:
             from .course_db import _load_db
             db = _load_db()
             for course in db.get("courses", []):
-                if course.get("ghin_name", "") == course_name:
+                if (course.get("ghin_name", "") == course_name
+                        or course.get("garmin_name", "") == course_name):
                     return course.get("ghin_list_text")
         except Exception:
             pass
@@ -502,43 +507,19 @@ class GHINClient:
         search_terms.append(course_name)
         logger.info("Course search terms: %s", search_terms)
 
-        # Try finding on the current tab (Recently Played), then My Courses
-        for tab_name in ["Recently Played", "My Courses"]:
-            if course_selected:
-                break
+        try:
+            page_text = driver.find_element("tag name", "body").text
+            logger.info("Course list page text (800): %s", page_text[:800])
 
-            try:
-                page_text = driver.find_element("tag name", "body").text
-                logger.info("[%s] Page text (800): %s", tab_name, page_text[:800])
+            course_selected = self._click_course_in_list(driver, search_terms)
 
-                course_selected = self._click_course_in_list(driver, search_terms)
-
-                if not course_selected and tab_name == "Recently Played":
-                    # Course not on Recently Played — switch to My Courses tab
-                    logger.info("Course not found on Recently Played, trying My Courses tab...")
-                    tab_clicked = False
-                    all_els = driver.find_elements("css selector",
-                        "button, a, div[role='tab'], span, div[class*='tab']")
-                    for el in all_els:
-                        if el.text.strip() == "My Courses":
-                            driver.execute_script("arguments[0].click();", el)
-                            tab_clicked = True
-                            logger.info("Clicked 'My Courses' tab")
-                            break
-                    if tab_clicked:
-                        time.sleep(3)
-                    else:
-                        logger.info("My Courses tab not found")
-                        break
-
-            except Exception as e:
-                logger.error("Error selecting course on %s: %s", tab_name, e)
-                report["issues"].append(f"Error selecting course: {e}")
+        except Exception as e:
+            logger.error("Error selecting course: %s", e)
+            report["issues"].append(f"Error selecting course: {e}")
 
         if not course_selected:
             report["issues"].append(
-                f"Could not find course '{course_name}' in GHIN list "
-                f"(tried Recently Played and My Courses). "
+                f"Could not find course '{course_name}' in GHIN recently played list. "
                 f"Search terms: {search_terms}")
             return report
 
