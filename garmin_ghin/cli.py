@@ -219,6 +219,28 @@ def cmd_fix_names() -> None:
         print("All course names already up to date.")
 
 
+def cmd_tees(args) -> None:
+    """Show tee info for all rounds in the database."""
+    from .scorecard_db import list_scorecards
+
+    scorecards = list_scorecards(limit=args.limit)
+    if not scorecards:
+        print("No scorecards in database.")
+        return
+
+    print(f"{'ID':>4}  {'Date':<12} {'Course':<32} {'Score':>5} {'Tees':<20} {'Garmin Tees'}")
+    print("-" * 95)
+
+    for sc in scorecards:
+        total = sc.get("total_score")
+        total_str = str(total) if total is not None else "-"
+        tee = sc.get("tee_name") or "-"
+        garmin_tee = sc.get("garmin_tee_name") or "-"
+        print(f"{sc['id']:>4}  {sc['date_played']:<12} {sc['course_name']:<32} {total_str:>5} {tee:<20} {garmin_tee}")
+
+    print(f"\n{len(scorecards)} round(s).")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Garmin golf scorecard tools")
     parser.add_argument(
@@ -268,6 +290,13 @@ def main() -> None:
     subparsers.add_parser("fix-names",
                           help="Apply course name mappings from courses.json to existing DB records")
 
+    # tees subcommand
+    tees_parser = subparsers.add_parser("tees", help="Show tee info for all rounds")
+    tees_parser.add_argument(
+        "--limit", type=int, default=100,
+        help="Max rounds to show (default: 100)",
+    )
+
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -283,6 +312,8 @@ def main() -> None:
         cmd_history(args)
     elif args.command == "fix-names":
         cmd_fix_names()
+    elif args.command == "tees":
+        cmd_tees(args)
     else:
         parser.print_help()
 

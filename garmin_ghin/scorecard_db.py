@@ -177,8 +177,8 @@ def list_scorecards(limit: int = 50) -> list[dict]:
     try:
         rows = conn.execute("""
             SELECT id, garmin_activity_id, course_name, date_played, tee_name,
-                   nine_played, num_holes_played, total_score, score_vs_par,
-                   total_putts, gir_summary
+                   garmin_tee_name, nine_played, num_holes_played, total_score,
+                   score_vs_par, total_putts, gir_summary
             FROM scorecards ORDER BY date_played DESC, id DESC LIMIT ?
         """, (limit,)).fetchall()
         return [dict(r) for r in rows]
