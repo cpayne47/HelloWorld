@@ -673,21 +673,20 @@ class GHINClient:
                 "button, a, input[type='submit'], div[role='button'], "
                 "span[class*='btn'], div[class*='btn'], div[class*='button']")
 
-            search_terms = ["enter hole", "hole-by-hole score"]
+            # IMPORTANT: Only match "enter hole" — NOT "hole-by-hole score",
+            # because that also matches the HOLE-BY-HOLE SCORE *tab* at the top,
+            # which navigates back to course selection.
             for el in all_els:
                 el_text = el.text.strip().lower()
                 if not el_text:
                     continue
-                for term in search_terms:
-                    if term in el_text:
-                        # Scroll into view and click
-                        driver.execute_script(
-                            "arguments[0].scrollIntoView({block: 'center'}); "
-                            "arguments[0].click();", el)
-                        hbh_entered = True
-                        logger.info("Clicked HBH button: '%s' (tag=%s)", el.text.strip(), el.tag_name)
-                        break
-                if hbh_entered:
+                if "enter" in el_text and "hole" in el_text:
+                    # Scroll into view and click
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'}); "
+                        "arguments[0].click();", el)
+                    hbh_entered = True
+                    logger.info("Clicked HBH button: '%s' (tag=%s)", el.text.strip(), el.tag_name)
                     break
 
             if not hbh_entered:
