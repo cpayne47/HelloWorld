@@ -501,21 +501,46 @@ class GHINClient:
         # ── Step 4: Select number of holes ──
         nine = scorecard.nine_played
         target_holes = "18" if nine == "both" else "9"
-        logger.info("Selecting %s holes...", target_holes)
+        logger.info("Selecting %s holes (nine_played=%s)...", target_holes, nine)
 
+        holes_selected = False
         try:
-            buttons = driver.find_elements("css selector", "button, div[role='button'], span, a")
-            for btn in buttons:
-                btn_text = btn.text.strip()
-                if f"{target_holes} Hole" in btn_text or btn_text == f"{target_holes} Holes":
-                    driver.execute_script("arguments[0].click();", btn)
-                    logger.info("Selected %s Holes", target_holes)
+            # Log all visible text on page for debugging
+            page_text = driver.find_element("tag name", "body").text
+            logger.debug("Page text after course selection (800): %s", page_text[:800])
+
+            # Search broadly — React SPAs often use divs, spans, labels as buttons
+            all_els = driver.find_elements("css selector",
+                "button, div[role='button'], span, label, a, div[class*='toggle'], "
+                "div[class*='button'], div[class*='option'], div[class*='pill']")
+            for el in all_els:
+                el_text = el.text.strip()
+                if not el_text:
+                    continue
+                # Match "9 Holes" or "18 Holes"
+                if el_text == f"{target_holes} Holes" or el_text == f"{target_holes} holes":
+                    driver.execute_script("arguments[0].click();", el)
+                    logger.info("Selected '%s' (tag=%s)", el_text, el.tag_name)
                     report["selections"]["holes"] = f"{target_holes} Holes"
+                    holes_selected = True
                     break
-            else:
-                # It may already be selected by default (18 is usually default)
-                report["selections"]["holes"] = f"{target_holes} Holes (default assumed)"
-                logger.info("Holes button not found — may already be %s", target_holes)
+
+            if not holes_selected:
+                # Broader match — look for any element containing the target
+                for el in all_els:
+                    el_text = el.text.strip()
+                    if f"{target_holes} Hole" in el_text:
+                        driver.execute_script("arguments[0].click();", el)
+                        logger.info("Selected '%s' via partial match (tag=%s)", el_text, el.tag_name)
+                        report["selections"]["holes"] = el_text
+                        holes_selected = True
+                        break
+
+            if not holes_selected:
+                report["selections"]["holes"] = f"{target_holes} Holes (NOT FOUND — default assumed)"
+                report["issues"].append(f"Could not find {target_holes} Holes button")
+                logger.warning("Holes button not found. Visible button-like texts: %s",
+                    [el.text.strip() for el in all_els if el.text.strip() and len(el.text.strip()) < 30][:20])
         except Exception as e:
             report["issues"].append(f"Error selecting holes: {e}")
 
@@ -608,12 +633,14 @@ class GHINClient:
         logger.info("Selecting score type: %s", target_type)
 
         try:
-            buttons = driver.find_elements("css selector", "button, div[role='button'], span, a")
-            for btn in buttons:
-                btn_text = btn.text.strip()
-                if btn_text == target_type:
-                    driver.execute_script("arguments[0].click();", btn)
-                    logger.info("Selected score type: %s", target_type)
+            all_els = driver.find_elements("css selector",
+                "button, div[role='button'], span, label, a, "
+                "div[class*='toggle'], div[class*='button'], div[class*='option'], div[class*='pill']")
+            for el in all_els:
+                el_text = el.text.strip()
+                if el_text == target_type:
+                    driver.execute_script("arguments[0].click();", el)
+                    logger.info("Selected score type: %s (tag=%s)", target_type, el.tag_name)
                     report["selections"]["score_type"] = target_type
                     break
             else:
@@ -689,33 +716,69 @@ class GHINClient:
         hbh_entered = False
 
         try:
-            buttons = driver.find_elements("css selector", "button, a, input[type='submit']")
-            for btn in buttons:
-                btn_text = btn.text.strip().lower()
-                if "enter hole" in btn_text or "hole-by-hole" in btn_text or "hole by hole" in btn_text:
-                    driver.execute_script("arguments[0].click();", btn)
-                    hbh_entered = True
-                    logger.info("Clicked: '%s'", btn.text.strip())
+            # Log all visible buttons/links for debugging
+            all_els = driver.find_elements("css selector",
+                "button, a, input[type='submit'], div[role='button'], "
+                "span[class*='btn'], div[class*='btn'], div[class*='button']")
+            visible_buttons = [(el.tag_name, el.text.strip()) for el in all_els
+                               if el.text.strip() and el.is_displayed()]
+            logger.info("Visible clickable elements: %s", visible_buttons[:30])
+
+            # Search for the enter hole-by-hole button with broad matching
+            search_terms = ["enter hole", "hole-by-hole", "hole by hole",
+                            "enter scores", "enter score", "hole-by-hole score"]
+            for el in all_els:
+                el_text = el.text.strip().lower()
+                if not el_text or not el.is_displayed():
+                    continue
+                for term in search_terms:
+                    if term in el_text:
+                        driver.execute_script("arguments[0].click();", el)
+                        hbh_entered = True
+                        logger.info("Clicked HBH button: '%s' (tag=%s, matched='%s')",
+                                    el.text.strip(), el.tag_name, term)
+                        break
+                if hbh_entered:
                     break
 
             if not hbh_entered:
-                # The form might already show the scorecard grid (no intermediate button)
-                # Check if score input fields are already visible
+                # Try page text to find the exact button label
+                page_text = driver.find_element("tag name", "body").text
+                logger.info("Page text for HBH search (1000): %s", page_text[:1000])
+
+                # Maybe it's just a generic "Continue" or "Next" button
+                for el in all_els:
+                    el_text = el.text.strip().lower()
+                    if el_text in ("continue", "next", "submit"):
+                        driver.execute_script("arguments[0].click();", el)
+                        hbh_entered = True
+                        logger.info("Clicked fallback button: '%s'", el.text.strip())
+                        break
+
+            if not hbh_entered:
+                # Check if score input fields are already visible (no button needed)
                 score_inputs = driver.find_elements("css selector",
-                    "input[type='number'], input[type='text'][class*='score'], "
-                    "input[class*='score'], td input")
+                    "input[type='number'], input[type='tel'], td input, "
+                    "input[class*='score'], input[aria-label*='score']")
                 if len(score_inputs) >= 9:
                     hbh_entered = True
                     logger.info("Score input fields already visible (%d found)", len(score_inputs))
 
         except Exception as e:
             report["issues"].append(f"Error entering hole-by-hole: {e}")
+            logger.error("Error in step 8: %s", e, exc_info=True)
 
         if not hbh_entered:
             report["issues"].append("Could not find Enter Hole-by-Hole button or score inputs")
+            # Don't return yet — log page state for debugging
+            try:
+                page_text = driver.find_element("tag name", "body").text
+                report["page_debug"] = page_text[:1500]
+            except Exception:
+                pass
             return report
 
-        time.sleep(3)
+        time.sleep(4)
 
         # ── Step 9: Fill in hole-by-hole scores ──
         logger.info("Filling in hole-by-hole scores...")
