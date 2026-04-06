@@ -84,22 +84,98 @@ class GarminClient:
             logger.info("Not logged in, redirected to SSO: %s", driver.current_url)
             print("Logging in with credentials from .env...")
             try:
-                # Wait for the login form to be ready
-                time.sleep(3)
+                # Wait for the login page to fully load
+                time.sleep(5)
 
-                email_field = driver.find_element("id", "username")
+                # Garmin SSO often embeds the login form in an iframe.
+                # Try to switch into it if present.
+                iframes = driver.find_elements("tag name", "iframe")
+                in_iframe = False
+                for iframe in iframes:
+                    src = iframe.get_attribute("src") or ""
+                    iframe_id = iframe.get_attribute("id") or ""
+                    logger.debug("Found iframe: id=%s src=%s", iframe_id, src[:80])
+                    if "sso" in src or "signin" in src or iframe_id == "gauth-widget-frame-gauth-widget":
+                        driver.switch_to.frame(iframe)
+                        in_iframe = True
+                        logger.info("Switched into SSO iframe: %s", iframe_id or src[:50])
+                        time.sleep(2)
+                        break
+
+                # Log page state for debugging
+                try:
+                    body_text = driver.find_element("tag name", "body").text[:500]
+                    logger.debug("Login page text: %s", body_text)
+                except Exception:
+                    pass
+
+                # Find and fill the email field
+                email_field = None
+                for selector in ["id:username", "id:email", "name:username", "name:email",
+                                 "css:[type='email']", "css:input[name='username']"]:
+                    method, value = selector.split(":", 1)
+                    try:
+                        if method == "css":
+                            email_field = driver.find_element("css selector", value)
+                        else:
+                            email_field = driver.find_element(method, value)
+                        logger.info("Found email field via %s", selector)
+                        break
+                    except Exception:
+                        continue
+
+                if not email_field:
+                    raise RuntimeError("Could not find email/username field on login page")
+
                 email_field.clear()
                 email_field.send_keys(self._config.email)
                 logger.info("Entered email: %s", self._config.email)
 
-                pw_field = driver.find_element("id", "password")
+                # Find and fill the password field
+                pw_field = None
+                for selector in ["id:password", "name:password", "css:[type='password']"]:
+                    method, value = selector.split(":", 1)
+                    try:
+                        if method == "css":
+                            pw_field = driver.find_element("css selector", value)
+                        else:
+                            pw_field = driver.find_element(method, value)
+                        logger.info("Found password field via %s", selector)
+                        break
+                    except Exception:
+                        continue
+
+                if not pw_field:
+                    raise RuntimeError("Could not find password field on login page")
+
                 pw_field.clear()
                 pw_field.send_keys(self._config.password)
                 logger.info("Entered password (length %d)", len(self._config.password))
 
-                login_btn = driver.find_element("id", "login-btn-signin")
+                # Find and click the sign-in button
+                login_btn = None
+                for selector in ["id:login-btn-signin", "css:button[type='submit']",
+                                 "css:#login-btn-signin", "css:.signin-btn"]:
+                    method, value = selector.split(":", 1)
+                    try:
+                        if method == "css":
+                            login_btn = driver.find_element("css selector", value)
+                        else:
+                            login_btn = driver.find_element(method, value)
+                        logger.info("Found login button via %s", selector)
+                        break
+                    except Exception:
+                        continue
+
+                if not login_btn:
+                    raise RuntimeError("Could not find sign-in button on login page")
+
                 login_btn.click()
                 logger.info("Clicked sign-in button")
+
+                # Switch back to main content if we were in an iframe
+                if in_iframe:
+                    driver.switch_to.default_content()
 
                 # Wait for redirect back to connect.garmin.com
                 for i in range(30):
@@ -123,6 +199,11 @@ class GarminClient:
                 time.sleep(5)
             except Exception as e:
                 logger.error("Auto-login failed: %s", e)
+                # Switch back to main content in case we're stuck in an iframe
+                try:
+                    driver.switch_to.default_content()
+                except Exception:
+                    pass
                 print(
                     f"Auto-login failed: {e}\n"
                     "The browser is still open — please log in manually.\n"
