@@ -197,6 +197,80 @@ def cmd_history(args) -> None:
     print(f"\n{len(scorecards)} round(s). Use 'history --id N' for full scorecard.")
 
 
+def cmd_sync(args) -> None:
+    """Check Garmin for new rounds and add any to the database."""
+    from .config import load_config
+    from .garmin_client import GarminClient
+    from .scorecard_db import save_scorecard, scorecard_exists
+
+    config = load_config()
+    client = GarminClient(config.garmin)
+
+    try:
+        print("Checking Garmin Connect for new rounds...")
+        activities = client.get_recent_golf_rounds(days_back=30, scroll_all=False)
+
+        if not activities:
+            print("No rounds found on Garmin.")
+            return
+
+        # Find new rounds (not yet in database)
+        new_rounds = []
+        for act in activities:
+            sc_id = act.get("scorecardId", "")
+            if sc_id and not scorecard_exists(sc_id):
+                new_rounds.append(act)
+
+        if not new_rounds:
+            print(f"No new rounds. ({len(activities)} on Garmin, all already in database.)")
+            return
+
+        print(f"Found {len(new_rounds)} new round(s).\n")
+
+        saved = 0
+        for i, act in enumerate(new_rounds):
+            sc_id = act.get("scorecardId", "")
+            href = act.get("href", "")
+            text = act.get("text", "")
+
+            print(f"  [{i+1}/{len(new_rounds)}] {text[:50]} — fetching...")
+
+            try:
+                scorecard = client.get_scorecard(sc_id, href=href)
+
+                if not scorecard.holes:
+                    print(f"    -> PARSER ERROR: No holes extracted.")
+                    print(f"    -> Debug: check debug_scorecard_text.txt")
+                    continue
+
+                if scorecard.played_holes:
+                    db_id = save_scorecard(scorecard)
+                    nine = scorecard.nine_played
+                    nine_label = {"front": "F9", "back": "B9", "both": "18"}.get(nine, "?")
+                    vs_par = scorecard.computed_total - scorecard.computed_par
+                    print(f"    -> {scorecard.course_name} | {scorecard.date_played} | "
+                          f"{nine_label} | Score: {scorecard.computed_total} ({vs_par:+d}) | "
+                          f"Tees: {scorecard.garmin_tee_name or '-'} | Saved (id={db_id})")
+                    saved += 1
+                else:
+                    print(f"    -> No scores recorded, skipping")
+
+                if i < len(new_rounds) - 1:
+                    time.sleep(2)
+
+            except Exception as e:
+                print(f"    -> Error: {e}")
+                logging.getLogger(__name__).debug("Error fetching scorecard", exc_info=True)
+
+        if saved:
+            print(f"\nAdded {saved} new round(s) to database.")
+        else:
+            print("\nNo new rounds to add.")
+
+    finally:
+        client.close()
+
+
 def cmd_fix_names() -> None:
     """Apply course name mappings from courses.json to existing DB records."""
     from .course_db import _load_db
@@ -286,6 +360,9 @@ def main() -> None:
         help="Max scorecards to show (default: 50)",
     )
 
+    # sync subcommand
+    subparsers.add_parser("sync", help="Check Garmin for new rounds and add to database")
+
     # fix-names subcommand
     subparsers.add_parser("fix-names",
                           help="Apply course name mappings from courses.json to existing DB records")
@@ -314,6 +391,8 @@ def main() -> None:
         cmd_fix_names()
     elif args.command == "tees":
         cmd_tees(args)
+    elif args.command == "sync":
+        cmd_sync(args)
     else:
         parser.print_help()
 
