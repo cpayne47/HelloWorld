@@ -591,77 +591,104 @@ class GHINClient:
         except Exception as e:
             report["issues"].append(f"Error selecting holes: {e}")
 
-        time.sleep(2)
+        # Extra wait after holes selection — the tee dropdown refreshes
+        # (e.g. 9 Holes shows Front/Back tee variants)
+        time.sleep(4)
 
         # ── Step 5: Select tees ──
-        logger.info("Reading tee options from dropdown...")
+        logger.info("Reading tee options from dropdown (nine_played=%s)...", nine)
         tee_options = []
         selected_tee = None
+        garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
 
         try:
-            # Find the tee dropdown/select
+            # Strategy 1: Look for a native <select> element
             selects = driver.find_elements("css selector", "select")
             tee_select = None
             for sel in selects:
-                # Check if this select has tee-related options
                 options = sel.find_elements("tag name", "option")
-                for opt in options:
-                    opt_text = opt.text.strip()
-                    if "/" in opt_text and any(c.isdigit() for c in opt_text):
-                        tee_select = sel
-                        break
-                if tee_select:
+                option_texts = [opt.text.strip() for opt in options if opt.text.strip()]
+                logger.debug("Found <select> with options: %s", option_texts[:10])
+                # Tee selects typically have rating/slope numbers
+                if any(any(c.isdigit() for c in ot) for ot in option_texts):
+                    tee_select = sel
                     break
 
             if tee_select:
+                logger.info("Found native <select> for tees")
+                # Scroll it into view
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", tee_select)
+                time.sleep(0.5)
+
                 options = tee_select.find_elements("tag name", "option")
                 for opt in options:
                     opt_text = opt.text.strip()
-                    if opt_text and opt_text != "Select Tees" and opt_text != "":
+                    if opt_text and opt_text.lower() not in ("", "select tees", "select"):
                         tee_options.append(opt_text)
-                logger.info("Found %d tee options: %s", len(tee_options), tee_options)
+                logger.info("Tee options (%d): %s", len(tee_options), tee_options)
 
-                # Pick best match
-                garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
                 best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
-
                 if best:
-                    # Click the matching option
-                    for opt in options:
-                        if opt.text.strip() == best:
-                            opt.click()
-                            selected_tee = best
-                            logger.info("Selected tee: %s (matched from Garmin tee: %s)",
-                                        best, garmin_tee)
-                            break
+                    # Use Select helper for native selects
+                    from selenium.webdriver.support.ui import Select
+                    select_helper = Select(tee_select)
+                    select_helper.select_by_visible_text(best)
+                    selected_tee = best
+                    logger.info("Selected tee via native select: '%s' (Garmin: %s, nine: %s)",
+                                best, garmin_tee, nine)
+                    time.sleep(1)
             else:
-                # Try clicking a dropdown that opens a custom select
-                dropdowns = driver.find_elements("css selector",
-                    "div[class*='select'], div[class*='dropdown'], div[class*='tee']")
-                for dd in dropdowns:
-                    dd_text = dd.text.strip()
-                    if "/" in dd_text and any(c.isdigit() for c in dd_text):
-                        # This looks like it already shows a tee — click to open
-                        driver.execute_script("arguments[0].click();", dd)
-                        time.sleep(1)
-                        # Read options
-                        option_els = driver.find_elements("css selector",
-                            "div[class*='option'], li[class*='option'], div[class*='menu'] div")
-                        for oel in option_els:
-                            ot = oel.text.strip()
-                            if ot and "/" in ot:
-                                tee_options.append(ot)
-                        logger.info("Custom dropdown tee options: %s", tee_options)
+                logger.info("No native <select> found, trying custom dropdown...")
+                # Strategy 2: Find any element on the page showing tee-like text
+                # (has numbers that look like rating/slope, e.g. "69.5 / 123 / 72")
+                all_els = driver.find_elements("css selector", "*")
+                tee_el = None
+                for el in all_els:
+                    try:
+                        el_text = el.text.strip()
+                        if not el_text or len(el_text) > 80:
+                            continue
+                        # Match pattern like "Copper/White 69.5 / 123 / 72"
+                        if re.search(r'\d+\.?\d*\s*/\s*\d+\s*/\s*\d+', el_text):
+                            tag = el.tag_name
+                            if tag in ('select', 'option', 'script', 'style'):
+                                continue
+                            tee_el = el
+                            logger.info("Found tee display element: tag=%s text='%s'", tag, el_text)
+                            break
+                    except Exception:
+                        continue
 
-                        garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
+                if tee_el:
+                    # Click to open the dropdown
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block: 'center'});", tee_el)
+                    time.sleep(0.5)
+                    driver.execute_script("arguments[0].click();", tee_el)
+                    time.sleep(2)
+
+                    # Read the dropdown options that appeared
+                    option_els = driver.find_elements("css selector",
+                        "option, li, div[class*='option'], div[role='option'], "
+                        "div[class*='menu'] > div, ul > li")
+                    for oel in option_els:
+                        ot = oel.text.strip()
+                        if ot and re.search(r'\d+\.?\d*\s*/\s*\d+', ot):
+                            tee_options.append(ot)
+                    logger.info("Custom dropdown tee options (%d): %s", len(tee_options), tee_options)
+
+                    if tee_options:
                         best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
                         if best:
                             for oel in option_els:
                                 if oel.text.strip() == best:
                                     driver.execute_script("arguments[0].click();", oel)
                                     selected_tee = best
+                                    logger.info("Selected tee via custom dropdown: '%s'", best)
                                     break
-                        break
+                else:
+                    logger.warning("Could not find any tee selector element on page")
 
         except Exception as e:
             report["issues"].append(f"Error selecting tees: {e}")
