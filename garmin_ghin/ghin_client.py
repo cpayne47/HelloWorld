@@ -446,13 +446,34 @@ class GHINClient:
         return None
 
     @staticmethod
+    def _get_ghin_tee_name(course_name: str, garmin_tee: str | None) -> str | None:
+        """Look up the GHIN tee name for a Garmin tee name from courses.json.
+
+        e.g. for Desert Mountain No 7, "Men's Tees" -> "Three"
+        """
+        if not garmin_tee:
+            return None
+        try:
+            from .course_db import _load_db
+            db = _load_db()
+            for course in db.get("courses", []):
+                if (course.get("ghin_name", "") == course_name
+                        or course.get("garmin_name", "") == course_name):
+                    tee_info = course.get("tees", {}).get(garmin_tee, {})
+                    return tee_info.get("ghin_tee_name")
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def _is_home_course(course_name: str) -> bool:
         """Check if a course should be scored as Home."""
         name_lower = course_name.lower()
         return any(home in name_lower for home in HOME_COURSES)
 
     def _best_tee_match(self, tee_options: list[str], garmin_tee: str | None,
-                        nine_played: str | None = None) -> str | None:
+                        nine_played: str | None = None,
+                        ghin_tee_name: str | None = None) -> str | None:
         """Pick the best tee from GHIN dropdown options based on Garmin tee name.
 
         Garmin tee names are like "White Tees", "Blue Tees", "Copper/White Tees".
@@ -461,13 +482,32 @@ class GHINClient:
 
         nine_played: "front", "back", or "both"/None — used to pick the right
         9-hole tee variant when options include (Front)/(Back).
+        ghin_tee_name: explicit GHIN tee name from courses.json (e.g. "Three")
         """
         if not tee_options:
             return None
         if len(tee_options) == 1:
             return tee_options[0]
 
-        # Even without a garmin_tee, prefer the correct nine (Front/Back)
+        # Priority 1: If we have an explicit GHIN tee name mapping, use it
+        if ghin_tee_name:
+            ghin_lower = ghin_tee_name.lower()
+            # Match with nine preference
+            if nine_played in ("front", "back"):
+                target = f"({nine_played})"
+                for opt in tee_options:
+                    if ghin_lower in opt.lower() and target in opt.lower():
+                        logger.info("Matched tee by ghin_tee_name '%s' + nine '%s': '%s'",
+                                    ghin_tee_name, nine_played, opt)
+                        return opt
+            # Match without nine
+            for opt in tee_options:
+                if ghin_lower in opt.lower():
+                    logger.info("Matched tee by ghin_tee_name '%s': '%s'",
+                                ghin_tee_name, opt)
+                    return opt
+
+        # Priority 2: Even without a garmin_tee, prefer the correct nine
         if not garmin_tee and nine_played in ("front", "back"):
             target = f"({nine_played})"
             for opt in tee_options:
@@ -475,26 +515,23 @@ class GHINClient:
                     return opt
             return tee_options[0]
 
+        # Priority 3: Color-word matching from Garmin tee name
         if garmin_tee:
-            # Extract color words from Garmin tee name (e.g. "Copper/White Tees" -> ["copper", "white"])
             garmin_colors = [w.lower().rstrip("s") for w in
                             garmin_tee.replace("/", " ").replace("Tees", "").replace("Tee", "").split()
                             if w.lower() not in ("tees", "tee", "men's", "women's")]
 
-            # Score each GHIN option by how many color words match
-            # Bonus point for matching the correct nine (Front/Back)
             best_score = -1
             best_option = None
             for opt in tee_options:
                 opt_lower = opt.lower()
                 score = sum(1 for color in garmin_colors if color in opt_lower)
 
-                # Boost/penalize based on front/back match
                 if nine_played == "back":
                     if "(back)" in opt_lower:
-                        score += 10  # Strong preference
+                        score += 10
                     elif "(front)" in opt_lower:
-                        score -= 10  # Wrong nine
+                        score -= 10
                 elif nine_played == "front":
                     if "(front)" in opt_lower:
                         score += 10
@@ -653,7 +690,9 @@ class GHINClient:
         # handlers often don't respond to JS-dispatched click events.
         from selenium.webdriver.common.action_chains import ActionChains
 
-        logger.info("Step 5: Selecting tees (nine_played=%s, garmin_tee=%s)...", nine, garmin_tee)
+        ghin_tee_name = self._get_ghin_tee_name(scorecard.course_name, garmin_tee)
+        logger.info("Step 5: Selecting tees (nine_played=%s, garmin_tee=%s, ghin_tee_name=%s)...",
+                     nine, garmin_tee, ghin_tee_name)
         tee_options = []
         selected_tee = None
 
@@ -778,7 +817,8 @@ class GHINClient:
                     logger.info("Tee options (%d): %s", len(tee_options), tee_options)
 
                     if tee_options:
-                        best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
+                        best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine,
+                                                     ghin_tee_name=ghin_tee_name)
                         logger.info("Best tee match: '%s'", best)
                         if best:
                             # Click the matching option with ActionChains too

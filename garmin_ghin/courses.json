@@ -20,11 +20,13 @@
       "tees": {
         "Men's Tees": {
           "tee_box": "T3",
+          "ghin_tee_name": "Three",
           "rating": null,
           "slope": null
         },
         "Women's Tees": {
           "tee_box": "T4",
+          "ghin_tee_name": "Four",
           "rating": null,
           "slope": null
         }
