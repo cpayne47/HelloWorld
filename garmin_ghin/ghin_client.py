@@ -536,6 +536,9 @@ class GHINClient:
             "issues": [],
         }
 
+        nine = scorecard.nine_played
+        garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
+
         # ── Step 1: Navigate to Post Score page ──
         logger.info("Navigating to Post Score page...")
         driver.get(GHIN_POST_SCORE_URL)
@@ -572,13 +575,10 @@ class GHINClient:
         logger.info("Selecting course: %s", course_name)
         course_selected = False
 
-        # Load ghin_list_text mapping from courses.json
         ghin_list_text = self._get_ghin_list_text(course_name)
-        # Build list of search terms to try, most specific first
         search_terms = []
         if ghin_list_text:
             search_terms.append(ghin_list_text)
-        # Also try the last word (e.g. "Apache" from "Desert Mountain Apache")
         parts = course_name.split()
         if len(parts) > 1:
             search_terms.append(parts[-1])
@@ -605,17 +605,14 @@ class GHINClient:
         time.sleep(3)
 
         # ── Step 4: Select number of holes ──
-        nine = scorecard.nine_played
         target_holes = "18" if nine == "both" else "9"
         logger.info("Selecting %s holes (nine_played=%s)...", target_holes, nine)
 
         holes_selected = False
         try:
-            # Log all visible text on page for debugging
             page_text = driver.find_element("tag name", "body").text
             logger.debug("Page text after course selection (800): %s", page_text[:800])
 
-            # Search broadly — React SPAs often use divs, spans, labels as buttons
             all_els = driver.find_elements("css selector",
                 "button, div[role='button'], span, label, a, div[class*='toggle'], "
                 "div[class*='button'], div[class*='option'], div[class*='pill']")
@@ -623,7 +620,6 @@ class GHINClient:
                 el_text = el.text.strip()
                 if not el_text:
                     continue
-                # Match "9 Holes" or "18 Holes"
                 if el_text == f"{target_holes} Holes" or el_text == f"{target_holes} holes":
                     driver.execute_script("arguments[0].click();", el)
                     logger.info("Selected '%s' (tag=%s)", el_text, el.tag_name)
@@ -632,7 +628,6 @@ class GHINClient:
                     break
 
             if not holes_selected:
-                # Broader match — look for any element containing the target
                 for el in all_els:
                     el_text = el.text.strip()
                     if f"{target_holes} Hole" in el_text:
@@ -650,30 +645,48 @@ class GHINClient:
         except Exception as e:
             report["issues"].append(f"Error selecting holes: {e}")
 
-        # Extra wait after holes selection — the tee dropdown refreshes
-        # (e.g. 9 Holes shows Front/Back tee variants)
         time.sleep(4)
 
         # ── Step 5: Select tees ──
-        logger.info("Reading tee options from dropdown (nine_played=%s, garmin_tee=%s)...",
-                     nine, scorecard.garmin_tee_name or scorecard.tee_name)
+        # The GHIN tee selector is a custom React dropdown. We use ActionChains
+        # (real mouse events) instead of JS click, because React synthetic event
+        # handlers often don't respond to JS-dispatched click events.
+        from selenium.webdriver.common.action_chains import ActionChains
+
+        logger.info("Step 5: Selecting tees (nine_played=%s, garmin_tee=%s)...", nine, garmin_tee)
         tee_options = []
         selected_tee = None
-        garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
 
         try:
-            # The GHIN tee selector is a custom React dropdown (not a native <select>).
-            # It sits below the "Tees" heading and shows the current selection with a
-            # chevron (▾).  We find it by locating the "Tees" heading, then looking
-            # for the next sibling container that holds the dropdown trigger.
+            # Take a screenshot for debugging
+            try:
+                ss_path = str(Path.home() / ".garmin_ghin" / "debug_tee_step.png")
+                driver.save_screenshot(ss_path)
+                logger.info("Saved pre-tee screenshot: %s", ss_path)
+            except Exception:
+                pass
 
-            # Step A: Find the "Tees" heading on the page
+            # Dump the page HTML around "Tees" for debugging
+            try:
+                page_html = driver.page_source
+                tees_idx = page_html.lower().find('>tees<')
+                if tees_idx >= 0:
+                    html_snippet = page_html[max(0, tees_idx - 200):tees_idx + 800]
+                    logger.info("HTML around 'Tees': %s", html_snippet)
+                else:
+                    logger.info("'Tees' not found in page HTML")
+                    # Try alternate search
+                    tees_idx = page_html.lower().find('tees')
+                    if tees_idx >= 0:
+                        logger.info("'tees' found at pos %d: %s",
+                                    tees_idx, page_html[max(0, tees_idx - 100):tees_idx + 400])
+            except Exception as he:
+                logger.debug("Could not dump HTML: %s", he)
+
+            # Find the "Tees" heading
             tees_heading = None
             heading_candidates = driver.find_elements("xpath",
-                "//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::h6 "
-                "or self::p or self::span or self::div or self::label]"
-                "[normalize-space(text())='Tees' or normalize-space(text())='TEES' "
-                "or normalize-space(text())='Tee' or normalize-space(text())='TEE']")
+                "//*[normalize-space(text())='Tees' or normalize-space(text())='TEES']")
             for hc in heading_candidates:
                 try:
                     if hc.is_displayed():
@@ -685,41 +698,34 @@ class GHINClient:
                     continue
 
             if not tees_heading:
-                logger.warning("Could not find 'Tees' heading on page")
-                # Dump visible text for debugging
+                logger.warning("Could not find 'Tees' heading")
                 try:
-                    body = driver.find_element("tag name", "body").text
-                    logger.info("Page text (600): %s", body[:600])
+                    body_text = driver.find_element("tag name", "body").text
+                    logger.info("Page text (600): %s", body_text[:600])
                 except Exception:
                     pass
             else:
-                # Step B: Starting from the Tees heading, walk up to its container
-                # and find the dropdown trigger — an element that shows rating/slope
-                # numbers (e.g. "Four (Front)  24.9 / 67 / 27") with a chevron.
+                # Walk up to find the dropdown container. The dropdown shows
+                # "Name (Front/Back)  NN.N / NNN / NN" with a chevron.
+                # We look in progressively larger ancestor containers.
                 dropdown_trigger = None
-
-                # Look in the heading's parent and grandparent for the dropdown
                 for ancestor_xpath in ["..", "../..", "../../.."]:
                     try:
                         container = tees_heading.find_element("xpath", ancestor_xpath)
-                        # Find child elements whose text has rating/slope numbers
                         children = container.find_elements("css selector", "*")
                         for child in children:
                             try:
                                 ct = child.text.strip()
                                 if not ct or len(ct) > 100:
                                     continue
-                                # Match "Something  NN.N / NNN / NN" pattern
                                 if re.search(r'\d+\.?\d*\s*/\s*\d+\s*/\s*\d+', ct):
-                                    # Prefer the most specific (innermost) clickable element
                                     tag = child.tag_name
                                     if tag in ('script', 'style', 'head', 'html', 'body'):
                                         continue
                                     if child.is_displayed():
                                         dropdown_trigger = child
-                                        logger.info("Found tee dropdown trigger: tag=%s text='%s'",
+                                        logger.info("Candidate tee trigger: tag=%s text='%s'",
                                                     tag, ct)
-                                        # Don't break — keep looking for a more specific child
                             except Exception:
                                 continue
                         if dropdown_trigger:
@@ -728,28 +734,35 @@ class GHINClient:
                         continue
 
                 if not dropdown_trigger:
-                    logger.warning("Could not find tee dropdown trigger near Tees heading")
+                    logger.warning("Could not find tee dropdown trigger")
                 else:
-                    # Step C: Click to open the dropdown
+                    # Use ActionChains for a REAL mouse click (not JS click).
+                    # React components respond to real browser mouse events.
+                    logger.info("Clicking tee dropdown with ActionChains...")
                     driver.execute_script(
                         "arguments[0].scrollIntoView({block: 'center'});", dropdown_trigger)
                     time.sleep(0.5)
-                    driver.execute_script("arguments[0].click();", dropdown_trigger)
-                    logger.info("Clicked tee dropdown trigger")
+                    ActionChains(driver).move_to_element(dropdown_trigger).click().perform()
+                    logger.info("ActionChains click performed on tee dropdown")
                     time.sleep(2)
 
-                    # Step D: Read all visible options — they appear as list items
-                    # below the trigger.  Each shows "Name (Front/Back)  NN.N / NNN / NN".
-                    # Use broad selectors since the dropdown is custom HTML.
+                    # Take screenshot after click
+                    try:
+                        ss_path2 = str(Path.home() / ".garmin_ghin" / "debug_tee_after_click.png")
+                        driver.save_screenshot(ss_path2)
+                        logger.info("Saved post-click screenshot: %s", ss_path2)
+                    except Exception:
+                        pass
+
+                    # Read dropdown options that appeared
                     option_els = driver.find_elements("css selector",
                         "li, div[role='option'], div[class*='option'], "
                         "div[class*='menu'] div, div[class*='list'] div, "
                         "ul div, ul li")
-                    # Also try: any visible element with rating text that appeared
                     if len(option_els) < 3:
                         option_els = driver.find_elements("xpath",
                             "//*[contains(text(), '/')]")
-                    logger.info("Found %d candidate option elements", len(option_els))
+                    logger.info("Found %d candidate option elements after click", len(option_els))
 
                     seen = set()
                     for oel in option_els:
@@ -764,19 +777,19 @@ class GHINClient:
                             continue
                     logger.info("Tee options (%d): %s", len(tee_options), tee_options)
 
-                    # Step E: Pick the best match and click it
                     if tee_options:
                         best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
                         logger.info("Best tee match: '%s'", best)
                         if best:
-                            # Find and click the option element
+                            # Click the matching option with ActionChains too
                             clicked = False
                             for oel in option_els:
                                 try:
                                     if oel.text.strip() == best:
                                         driver.execute_script(
                                             "arguments[0].scrollIntoView({block: 'center'});", oel)
-                                        driver.execute_script("arguments[0].click();", oel)
+                                        time.sleep(0.3)
+                                        ActionChains(driver).move_to_element(oel).click().perform()
                                         selected_tee = best
                                         logger.info("Selected tee: '%s'", best)
                                         clicked = True
@@ -784,12 +797,11 @@ class GHINClient:
                                 except Exception:
                                     continue
                             if not clicked:
-                                # Try partial text match
                                 for oel in option_els:
                                     try:
                                         ot = oel.text.strip()
                                         if best in ot or ot in best:
-                                            driver.execute_script("arguments[0].click();", oel)
+                                            ActionChains(driver).move_to_element(oel).click().perform()
                                             selected_tee = best
                                             logger.info("Selected tee via partial match: '%s'", ot)
                                             clicked = True
