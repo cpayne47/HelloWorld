@@ -467,6 +467,14 @@ class GHINClient:
         if len(tee_options) == 1:
             return tee_options[0]
 
+        # Even without a garmin_tee, prefer the correct nine (Front/Back)
+        if not garmin_tee and nine_played in ("front", "back"):
+            target = f"({nine_played})"
+            for opt in tee_options:
+                if target in opt.lower():
+                    return opt
+            return tee_options[0]
+
         if garmin_tee:
             # Extract color words from Garmin tee name (e.g. "Copper/White Tees" -> ["copper", "white"])
             garmin_colors = [w.lower().rstrip("s") for w in
@@ -654,148 +662,142 @@ class GHINClient:
         garmin_tee = scorecard.garmin_tee_name or scorecard.tee_name
 
         try:
-            # Strategy 1: Look for a native <select> element
-            selects = driver.find_elements("css selector", "select")
-            logger.info("Found %d <select> elements on page", len(selects))
-            tee_select = None
-            for idx, sel in enumerate(selects):
-                options = sel.find_elements("tag name", "option")
-                option_texts = [opt.text.strip() for opt in options if opt.text.strip()]
-                logger.info("  <select> #%d options: %s", idx, option_texts[:10])
-                # Tee selects typically have rating/slope numbers or tee-like words
-                has_digits = any(any(c.isdigit() for c in ot) for ot in option_texts)
-                has_tee_words = any(
-                    any(w in ot.lower() for w in ("tee", "front", "back", "men", "women", "gold", "blue", "white", "red", "copper"))
-                    for ot in option_texts
-                )
-                if has_digits or has_tee_words:
-                    tee_select = sel
-                    logger.info("  -> Matched as tee selector (digits=%s, tee_words=%s)", has_digits, has_tee_words)
-                    break
+            # The GHIN tee selector is a custom React dropdown (not a native <select>).
+            # It sits below the "Tees" heading and shows the current selection with a
+            # chevron (▾).  We find it by locating the "Tees" heading, then looking
+            # for the next sibling container that holds the dropdown trigger.
 
-            if tee_select:
-                logger.info("Found native <select> for tees")
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({block: 'center'});", tee_select)
-                time.sleep(0.5)
-
-                options = tee_select.find_elements("tag name", "option")
-                for opt in options:
-                    opt_text = opt.text.strip()
-                    if opt_text and opt_text.lower() not in ("", "select tees", "select"):
-                        tee_options.append(opt_text)
-                logger.info("Tee options (%d): %s", len(tee_options), tee_options)
-
-                best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
-                if best:
-                    from selenium.webdriver.support.ui import Select
-                    select_helper = Select(tee_select)
-                    select_helper.select_by_visible_text(best)
-                    selected_tee = best
-                    logger.info("Selected tee via native select: '%s' (Garmin: %s, nine: %s)",
-                                best, garmin_tee, nine)
-                    time.sleep(1)
-            else:
-                logger.info("No native <select> found, trying custom dropdown...")
-                # Strategy 2: Look for elements with tee/rating text using targeted selectors
-                # rather than iterating all elements
-                tee_el = None
-
-                # Try XPath: find elements containing rating/slope pattern text
+            # Step A: Find the "Tees" heading on the page
+            tees_heading = None
+            heading_candidates = driver.find_elements("xpath",
+                "//*[self::h1 or self::h2 or self::h3 or self::h4 or self::h5 or self::h6 "
+                "or self::p or self::span or self::div or self::label]"
+                "[normalize-space(text())='Tees' or normalize-space(text())='TEES' "
+                "or normalize-space(text())='Tee' or normalize-space(text())='TEE']")
+            for hc in heading_candidates:
                 try:
-                    xpath_candidates = driver.find_elements("xpath",
-                        "//*[contains(text(), '/') and string-length(text()) < 80]")
-                    logger.info("XPath candidates with '/': %d", len(xpath_candidates))
-                    for el in xpath_candidates:
-                        try:
-                            el_text = el.text.strip()
-                            if not el_text or len(el_text) > 80:
-                                continue
-                            if re.search(r'\d+\.?\d*\s*/\s*\d+', el_text):
-                                tag = el.tag_name
-                                if tag in ('select', 'option', 'script', 'style', 'head'):
-                                    continue
-                                tee_el = el
-                                logger.info("Found tee display element: tag=%s text='%s'", tag, el_text)
-                                break
-                        except Exception:
-                            continue
-                except Exception as xe:
-                    logger.debug("XPath tee search failed: %s", xe)
+                    if hc.is_displayed():
+                        tees_heading = hc
+                        logger.info("Found 'Tees' heading: tag=%s text='%s'",
+                                    hc.tag_name, hc.text.strip())
+                        break
+                except Exception:
+                    continue
 
-                # Strategy 3: Look for clickable dropdown triggers near tee labels
-                if not tee_el:
-                    logger.info("Trying to find tee dropdown by label...")
+            if not tees_heading:
+                logger.warning("Could not find 'Tees' heading on page")
+                # Dump visible text for debugging
+                try:
+                    body = driver.find_element("tag name", "body").text
+                    logger.info("Page text (600): %s", body[:600])
+                except Exception:
+                    pass
+            else:
+                # Step B: Starting from the Tees heading, walk up to its container
+                # and find the dropdown trigger — an element that shows rating/slope
+                # numbers (e.g. "Four (Front)  24.9 / 67 / 27") with a chevron.
+                dropdown_trigger = None
+
+                # Look in the heading's parent and grandparent for the dropdown
+                for ancestor_xpath in ["..", "../..", "../../.."]:
                     try:
-                        # Look for "Tee" or "Tees" label and nearby clickable elements
-                        labels = driver.find_elements("xpath",
-                            "//*[contains(translate(text(), 'TEE', 'tee'), 'tee') and "
-                            "string-length(text()) < 30]")
-                        logger.info("Found %d tee-label elements", len(labels))
-                        for lbl in labels[:5]:
+                        container = tees_heading.find_element("xpath", ancestor_xpath)
+                        # Find child elements whose text has rating/slope numbers
+                        children = container.find_elements("css selector", "*")
+                        for child in children:
                             try:
-                                logger.info("  Tee label: tag=%s text='%s'", lbl.tag_name, lbl.text.strip())
-                                # Try clicking the label's parent or sibling dropdown
-                                parent = lbl.find_element("xpath", "..")
-                                # Look for a clickable element in the parent container
-                                clickables = parent.find_elements("css selector",
-                                    "select, div[class*='select'], div[class*='dropdown'], "
-                                    "div[role='listbox'], div[role='combobox'], "
-                                    "[class*='react-select'], [class*='MuiSelect']")
-                                if clickables:
-                                    tee_el = clickables[0]
-                                    logger.info("Found dropdown near tee label: tag=%s", tee_el.tag_name)
-                                    break
-                                # Also check grandparent
-                                grandparent = parent.find_element("xpath", "..")
-                                clickables = grandparent.find_elements("css selector",
-                                    "select, div[class*='select'], div[class*='dropdown'], "
-                                    "div[role='listbox'], div[role='combobox'], "
-                                    "[class*='react-select'], [class*='MuiSelect']")
-                                if clickables:
-                                    tee_el = clickables[0]
-                                    logger.info("Found dropdown near tee grandparent: tag=%s", tee_el.tag_name)
-                                    break
+                                ct = child.text.strip()
+                                if not ct or len(ct) > 100:
+                                    continue
+                                # Match "Something  NN.N / NNN / NN" pattern
+                                if re.search(r'\d+\.?\d*\s*/\s*\d+\s*/\s*\d+', ct):
+                                    # Prefer the most specific (innermost) clickable element
+                                    tag = child.tag_name
+                                    if tag in ('script', 'style', 'head', 'html', 'body'):
+                                        continue
+                                    if child.is_displayed():
+                                        dropdown_trigger = child
+                                        logger.info("Found tee dropdown trigger: tag=%s text='%s'",
+                                                    tag, ct)
+                                        # Don't break — keep looking for a more specific child
                             except Exception:
                                 continue
-                    except Exception as le:
-                        logger.debug("Label-based tee search failed: %s", le)
+                        if dropdown_trigger:
+                            break
+                    except Exception:
+                        continue
 
-                if tee_el:
-                    # Click to open the dropdown
+                if not dropdown_trigger:
+                    logger.warning("Could not find tee dropdown trigger near Tees heading")
+                else:
+                    # Step C: Click to open the dropdown
                     driver.execute_script(
-                        "arguments[0].scrollIntoView({block: 'center'});", tee_el)
+                        "arguments[0].scrollIntoView({block: 'center'});", dropdown_trigger)
                     time.sleep(0.5)
-                    driver.execute_script("arguments[0].click();", tee_el)
+                    driver.execute_script("arguments[0].click();", dropdown_trigger)
+                    logger.info("Clicked tee dropdown trigger")
                     time.sleep(2)
 
-                    # Read the dropdown options that appeared
+                    # Step D: Read all visible options — they appear as list items
+                    # below the trigger.  Each shows "Name (Front/Back)  NN.N / NNN / NN".
+                    # Use broad selectors since the dropdown is custom HTML.
                     option_els = driver.find_elements("css selector",
-                        "option, li, div[class*='option'], div[role='option'], "
-                        "div[class*='menu'] > div, ul > li")
-                    for oel in option_els:
-                        ot = oel.text.strip()
-                        if ot and re.search(r'\d+\.?\d*\s*/\s*\d+', ot):
-                            tee_options.append(ot)
-                    logger.info("Custom dropdown tee options (%d): %s", len(tee_options), tee_options)
+                        "li, div[role='option'], div[class*='option'], "
+                        "div[class*='menu'] div, div[class*='list'] div, "
+                        "ul div, ul li")
+                    # Also try: any visible element with rating text that appeared
+                    if len(option_els) < 3:
+                        option_els = driver.find_elements("xpath",
+                            "//*[contains(text(), '/')]")
+                    logger.info("Found %d candidate option elements", len(option_els))
 
+                    seen = set()
+                    for oel in option_els:
+                        try:
+                            ot = oel.text.strip()
+                            if not ot or ot in seen or len(ot) > 100:
+                                continue
+                            if re.search(r'\d+\.?\d*\s*/\s*\d+\s*/\s*\d+', ot):
+                                tee_options.append(ot)
+                                seen.add(ot)
+                        except Exception:
+                            continue
+                    logger.info("Tee options (%d): %s", len(tee_options), tee_options)
+
+                    # Step E: Pick the best match and click it
                     if tee_options:
                         best = self._best_tee_match(tee_options, garmin_tee, nine_played=nine)
+                        logger.info("Best tee match: '%s'", best)
                         if best:
+                            # Find and click the option element
+                            clicked = False
                             for oel in option_els:
-                                if oel.text.strip() == best:
-                                    driver.execute_script("arguments[0].click();", oel)
-                                    selected_tee = best
-                                    logger.info("Selected tee via custom dropdown: '%s'", best)
-                                    break
-                else:
-                    logger.warning("Could not find any tee selector element on page")
-                    # Dump page text for debugging
-                    try:
-                        page_text = driver.find_element("tag name", "body").text
-                        logger.info("Page text for tee debugging (600 chars): %s", page_text[:600])
-                    except Exception:
-                        pass
+                                try:
+                                    if oel.text.strip() == best:
+                                        driver.execute_script(
+                                            "arguments[0].scrollIntoView({block: 'center'});", oel)
+                                        driver.execute_script("arguments[0].click();", oel)
+                                        selected_tee = best
+                                        logger.info("Selected tee: '%s'", best)
+                                        clicked = True
+                                        break
+                                except Exception:
+                                    continue
+                            if not clicked:
+                                # Try partial text match
+                                for oel in option_els:
+                                    try:
+                                        ot = oel.text.strip()
+                                        if best in ot or ot in best:
+                                            driver.execute_script("arguments[0].click();", oel)
+                                            selected_tee = best
+                                            logger.info("Selected tee via partial match: '%s'", ot)
+                                            clicked = True
+                                            break
+                                    except Exception:
+                                        continue
+                    else:
+                        logger.warning("No tee options found after opening dropdown")
 
         except Exception as e:
             report["issues"].append(f"Error selecting tees: {e}")
